@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>EVE Competition Scalper</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #07111f;
+      --panel: #0e1b2d;
+      --panel-2: #12233a;
+      --line: #213853;
+      --text: #ecf5ff;
+      --muted: #8ea5be;
+      --accent: #45d6ff;
+      --good: #45e09c;
+      --bad: #ff6f86;
+      --warn: #ffcf66;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: radial-gradient(circle at top right, #102842 0, var(--bg) 40%);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    .shell { width: min(1500px, 96vw); margin: 0 auto; padding: 26px 0 54px; }
+    .topbar { display: flex; justify-content: space-between; gap: 20px; align-items: flex-start; margin-bottom: 18px; }
+    h1 { margin: 0; font-size: clamp(26px, 4vw, 44px); letter-spacing: -0.035em; }
+    .subtitle { color: var(--muted); margin-top: 7px; }
+    .connection { display: flex; gap: 8px; align-items: center; color: var(--muted); font-size: 14px; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--bad); box-shadow: 0 0 12px currentColor; }
+    .dot.online { background: var(--good); }
+    .hero { display: grid; grid-template-columns: 1.3fr 0.7fr; gap: 14px; margin-bottom: 14px; }
+    .card { background: linear-gradient(180deg, rgba(18,35,58,.96), rgba(10,24,41,.96)); border: 1px solid var(--line); border-radius: 18px; padding: 20px; box-shadow: 0 16px 44px rgba(0,0,0,.22); }
+    .phase-line { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+    .phase { font-size: 14px; letter-spacing: .12em; color: var(--accent); font-weight: 800; }
+    .clock { font-variant-numeric: tabular-nums; font-size: clamp(42px, 7vw, 78px); font-weight: 900; letter-spacing: -0.05em; margin: 12px 0 4px; }
+    .progress { height: 10px; border-radius: 999px; background: #07111f; border: 1px solid var(--line); overflow: hidden; margin-top: 18px; }
+    .progress > div { height: 100%; width: 0; background: linear-gradient(90deg, var(--accent), var(--good)); transition: width .5s ease; }
+    .session-meta { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-top: 16px; }
+    .meta { padding: 12px; border-radius: 12px; background: rgba(5,15,27,.55); border: 1px solid rgba(78,113,148,.25); }
+    .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }
+    .value { margin-top: 5px; font-weight: 750; overflow-wrap: anywhere; }
+    .strategy-name { font-size: 24px; font-weight: 850; margin-top: 10px; }
+    .strategy-copy { color: var(--muted); line-height: 1.55; margin-top: 8px; }
+    .stats { display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px; margin-bottom: 14px; }
+    .stat { min-height: 102px; }
+    .stat .big { font-size: 27px; font-weight: 850; margin-top: 10px; font-variant-numeric: tabular-nums; }
+    .positive { color: var(--good); }
+    .negative { color: var(--bad); }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    h2 { margin: 0 0 14px; font-size: 18px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 11px 9px; border-bottom: 1px solid rgba(65,92,122,.32); font-size: 13px; }
+    th { color: var(--muted); font-weight: 650; }
+    tbody tr:first-child { background: rgba(69,214,255,.06); }
+    .badge { display: inline-flex; align-items: center; border-radius: 999px; padding: 5px 9px; font-size: 11px; font-weight: 800; letter-spacing: .05em; border: 1px solid var(--line); }
+    .badge.BUY, .badge.CLOSED { color: var(--good); }
+    .badge.SELL { color: var(--bad); }
+    .badge.OPEN { color: var(--warn); }
+    .trade { border: 1px solid rgba(77,111,146,.34); border-radius: 14px; margin-bottom: 10px; overflow: hidden; }
+    .trade summary { list-style: none; cursor: pointer; display: grid; grid-template-columns: 90px 1fr 100px 120px; gap: 10px; align-items: center; padding: 14px; background: rgba(6,17,30,.45); }
+    .trade summary::-webkit-details-marker { display: none; }
+    .trade-body { padding: 16px; border-top: 1px solid var(--line); }
+    .reason-list { margin: 10px 0 0; padding-left: 20px; color: #c4d7ea; }
+    .details-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-top: 14px; }
+    pre { white-space: pre-wrap; word-break: break-word; color: #b7cce0; background: #07111f; padding: 12px; border-radius: 10px; border: 1px solid var(--line); font-size: 12px; }
+    .log { display: grid; grid-template-columns: 90px 130px 1fr; gap: 10px; padding: 9px 0; border-bottom: 1px solid rgba(65,92,122,.28); font-size: 13px; }
+    .empty { color: var(--muted); padding: 20px 0; }
+    .wide { grid-column: 1 / -1; }
+    @media (max-width: 1050px) {
+      .hero, .grid { grid-template-columns: 1fr; }
+      .stats { grid-template-columns: repeat(3, 1fr); }
+      .session-meta, .details-grid { grid-template-columns: repeat(2, 1fr); }
+    }
+    @media (max-width: 640px) {
+      .shell { width: 94vw; padding-top: 16px; }
+      .topbar { flex-direction: column; }
+      .stats { grid-template-columns: repeat(2, 1fr); }
+      .session-meta, .details-grid { grid-template-columns: 1fr; }
+      .trade summary { grid-template-columns: 70px 1fr; }
+      .trade summary > :nth-child(3), .trade summary > :nth-child(4) { text-align: left !important; }
+      .log { grid-template-columns: 1fr; gap: 3px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <div class="topbar">
+      <div>
+        <h1>EVE Competition Scalper</h1>
+        <div class="subtitle">XAUUSD · M5 · 60-minute research · 60-minute autonomous trading</div>
+      </div>
+      <div class="connection"><span id="connectionDot" class="dot"></span><span id="connectionText">Waiting for MT5</span></div>
+    </div>
+
+    <section class="hero">
+      <div class="card">
+        <div class="phase-line"><span id="phase" class="phase">WAITING</span><span id="phaseNote" class="label">Attach the EA</span></div>
+        <div id="clock" class="clock">60:00</div>
+        <div id="phaseDescription" class="strategy-copy">The session starts automatically when the EA connects from an XAUUSD M5 chart.</div>
+        <div class="progress"><div id="progressBar"></div></div>
+        <div class="session-meta">
+          <div class="meta"><div class="label">Symbol</div><div id="symbol" class="value">XAUUSD</div></div>
+          <div class="meta"><div class="label">Timeframe</div><div id="timeframe" class="value">M5</div></div>
+          <div class="meta"><div class="label">Session</div><div id="sessionId" class="value">—</div></div>
+          <div class="meta"><div class="label">Started</div><div id="startedAt" class="value">—</div></div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="label">Frozen strategy</div>
+        <div id="selectedStrategy" class="strategy-name">Research not finished</div>
+        <div id="strategyCopy" class="strategy-copy">The engine compares T3, Squeeze Momentum, Chaikin Volatility, Change of Volatility, ATR and M5 structure combinations during the first hour.</div>
+      </div>
+    </section>
+
+    <section class="stats">
+      <div class="card stat"><div class="label">Net P/L</div><div id="netProfit" class="big">$0.00</div></div>
+      <div class="card stat"><div class="label">Trades</div><div id="trades" class="big">0</div></div>
+      <div class="card stat"><div class="label">Win rate</div><div id="winRate" class="big">0%</div></div>
+      <div class="card stat"><div class="label">Profit factor</div><div id="profitFactor" class="big">0.00</div></div>
+      <div class="card stat"><div class="label">Average R</div><div id="averageR" class="big">0.00R</div></div>
+      <div class="card stat"><div class="label">Open trades</div><div id="openTrades" class="big">0</div></div>
+    </section>
+
+    <section class="grid">
+      <div class="card">
+        <h2>Research ranking</h2>
+        <div id="candidateWrap" class="empty">Waiting for the first market-data upload.</div>
+      </div>
+      <div class="card">
+        <h2>Engine activity</h2>
+        <div id="logs" class="empty">No activity yet.</div>
+      </div>
+      <div class="card wide">
+        <h2>Full trade reports</h2>
+        <div id="tradeReports" class="empty">No trades have been recorded.</div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const money = (n) => `${n < 0 ? '-' : ''}$${Math.abs(Number(n || 0)).toFixed(2)}`;
+    const fmtTime = (unix) => unix ? new Date(unix * 1000).toLocaleString() : '—';
+    const fmtClock = (seconds) => {
+      seconds = Math.max(0, Number(seconds || 0));
+      const m = Math.floor(seconds / 60);
+      const s = Math.floor(seconds % 60);
+      return `${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+    };
+    const esc = (s) => String(s ?? '').replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
+    const strategyLabel = (name) => ({
+      squeeze_release_t3: 'T3 Squeeze Release',
+      t3_pullback_resume: 'T3 Pullback Resume',
+      volatility_structure_break: 'Volatility Structure Break',
+      t3_momentum_continuation: 'T3 Momentum Continuation',
+      squeeze_reversion: 'Squeeze Mean Reversion'
+    }[name] || name || 'Research not finished');
+
+    function setPnl(id, value, suffix='') {
+      const el = $(id);
+      el.textContent = `${value}${suffix}`;
+      el.classList.toggle('positive', Number(value) > 0);
+      el.classList.toggle('negative', Number(value) < 0);
+    }
+
+    function renderCandidates(rows) {
+      if (!rows?.length) {
+        $('candidateWrap').className = 'empty';
+        $('candidateWrap').textContent = 'Research results will appear after MT5 sends enough M5 history.';
+        return;
+      }
+      $('candidateWrap').className = '';
+      $('candidateWrap').innerHTML = `<table>
+        <thead><tr><th>Rank</th><th>Strategy</th><th>Score</th><th>Trades</th><th>Win rate</th><th>Net R</th></tr></thead>
+        <tbody>${rows.map((r,i)=>`<tr>
+          <td>${i+1}</td><td>${esc(r.label)}</td><td>${Number(r.score).toFixed(2)}</td>
+          <td>${r.trades}</td><td>${Number(r.win_rate).toFixed(1)}%</td><td>${Number(r.net_r).toFixed(2)}R</td>
+        </tr>`).join('')}</tbody></table>`;
+    }
+
+    function renderLogs(rows) {
+      if (!rows?.length) { $('logs').className='empty'; $('logs').textContent='No activity yet.'; return; }
+      $('logs').className='';
+      $('logs').innerHTML = rows.slice(0,30).map(r=>`<div class="log">
+        <span class="label">${new Date(r.created_at*1000).toLocaleTimeString()}</span>
+        <strong>${esc(r.event)}</strong><span>${esc(r.message)}</span>
+      </div>`).join('');
+    }
+
+    function renderTrades(rows) {
+      if (!rows?.length) { $('tradeReports').className='empty'; $('tradeReports').textContent='No trades have been recorded.'; return; }
+      $('tradeReports').className='';
+      $('tradeReports').innerHTML = rows.map((r,i)=>`<details class="trade" ${i===0?'open':''}>
+        <summary>
+          <span class="badge ${esc(r.direction)}">${esc(r.direction)}</span>
+          <strong>${esc(strategyLabel(r.strategy))}</strong>
+          <span class="badge ${esc(r.status)}">${esc(r.status)}</span>
+          <strong class="${r.net_profit>0?'positive':r.net_profit<0?'negative':''}" style="text-align:right">${money(r.net_profit)}</strong>
+        </summary>
+        <div class="trade-body">
+          <div class="label">Entry reasons</div>
+          <ul class="reason-list">${(r.reasons||[]).map(x=>`<li>${esc(x)}</li>`).join('') || '<li>No linked signal explanation.</li>'}</ul>
+          <div class="details-grid">
+            <div class="meta"><div class="label">Entry</div><div class="value">${Number(r.entry_price||0).toFixed(2)}</div></div>
+            <div class="meta"><div class="label">Exit</div><div class="value">${r.exit_price ? Number(r.exit_price).toFixed(2) : 'Open'}</div></div>
+            <div class="meta"><div class="label">Stop</div><div class="value">${r.stop_loss ? Number(r.stop_loss).toFixed(2) : '—'}</div></div>
+            <div class="meta"><div class="label">Target</div><div class="value">${r.take_profit ? Number(r.take_profit).toFixed(2) : '—'}</div></div>
+            <div class="meta"><div class="label">Volume</div><div class="value">${Number(r.volume||0).toFixed(2)} lots</div></div>
+            <div class="meta"><div class="label">Confidence</div><div class="value">${r.confidence ? Number(r.confidence).toFixed(1)+'%' : '—'}</div></div>
+            <div class="meta"><div class="label">Result</div><div class="value">${r.result_r==null?'—':Number(r.result_r).toFixed(2)+'R'}</div></div>
+            <div class="meta"><div class="label">MFE / MAE</div><div class="value">${r.mfe_r==null?'—':Number(r.mfe_r).toFixed(2)+'R'} / ${r.mae_r==null?'—':Number(r.mae_r).toFixed(2)+'R'}</div></div>
+            <div class="meta"><div class="label">Opened</div><div class="value">${fmtTime(r.opened_at)}</div></div>
+            <div class="meta"><div class="label">Closed</div><div class="value">${fmtTime(r.closed_at)}</div></div>
+            <div class="meta"><div class="label">Commission</div><div class="value">${money(r.commission)}</div></div>
+            <div class="meta"><div class="label">Swap</div><div class="value">${money(r.swap)}</div></div>
+          </div>
+          <div class="label" style="margin-top:14px">Indicator snapshot</div>
+          <pre>${esc(JSON.stringify(r.indicator_snapshot || {}, null, 2))}</pre>
+        </div>
+      </details>`).join('');
+    }
+
+    function render(data) {
+      if (!data.has_session) {
+        $('connectionText').textContent='Waiting for MT5';
+        $('connectionDot').classList.remove('online');
+        return;
+      }
+      const s = data.session;
+      const seenRecently = s.last_seen_at && (Date.now()/1000 - s.last_seen_at < 15);
+      $('connectionDot').classList.toggle('online', seenRecently);
+      $('connectionText').textContent = seenRecently ? 'MT5 connected' : 'MT5 connection stale';
+      $('phase').textContent = s.phase;
+      $('clock').textContent = fmtClock(s.remaining_seconds);
+      $('phaseNote').textContent = s.phase === 'RESEARCH' ? 'No trades allowed' : s.phase === 'TRADING' ? 'Autonomous execution live' : 'No new entries';
+      $('phaseDescription').textContent = s.phase === 'RESEARCH'
+        ? 'The engine is observing XAUUSD and ranking candidate M5 strategies. Trading remains physically blocked.'
+        : s.phase === 'TRADING'
+          ? 'The research winner is frozen. MT5 now executes qualifying signals at a fixed 0.01 lots.'
+          : 'The two-hour competition window has finished. Existing positions are not forcibly closed.';
+      const phaseProgress = s.phase === 'RESEARCH' ? Math.min(100, s.elapsed_seconds/3600*100)
+        : s.phase === 'TRADING' ? Math.min(100, (s.elapsed_seconds-3600)/3600*100) : 100;
+      $('progressBar').style.width = `${Math.max(0, phaseProgress)}%`;
+      $('symbol').textContent=s.symbol;
+      $('timeframe').textContent=s.timeframe;
+      $('sessionId').textContent=s.id;
+      $('startedAt').textContent=fmtTime(s.started_at);
+      $('selectedStrategy').textContent=strategyLabel(s.selected_strategy);
+      $('strategyCopy').textContent = s.selected_strategy
+        ? 'This strategy was selected from the research ranking and remains frozen throughout the trading hour.'
+        : 'The research engine is still comparing the candidate strategies.';
+
+      const st=data.stats;
+      $('netProfit').textContent=money(st.net_profit);
+      $('netProfit').classList.toggle('positive',st.net_profit>0);
+      $('netProfit').classList.toggle('negative',st.net_profit<0);
+      $('trades').textContent=st.trades;
+      $('winRate').textContent=`${Number(st.win_rate).toFixed(1)}%`;
+      $('profitFactor').textContent=Number(st.profit_factor).toFixed(2);
+      $('averageR').textContent=`${Number(st.average_r).toFixed(2)}R`;
+      $('openTrades').textContent=st.open_trades;
+      renderCandidates(data.candidate_scores);
+      renderLogs(data.logs);
+      renderTrades(data.trade_reports);
+    }
+
+    async function refresh() {
+      try {
+        const res = await fetch('/api/dashboard', {cache:'no-store'});
+        render(await res.json());
+      } catch (e) {
+        $('connectionDot').classList.remove('online');
+        $('connectionText').textContent='Dashboard connection error';
+      }
+    }
+    refresh();
+    setInterval(refresh, 2000);
+  </script>
+</body>
+</html>
