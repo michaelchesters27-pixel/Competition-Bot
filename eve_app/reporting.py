@@ -164,6 +164,30 @@ def _position_reports(storage: Storage, session: dict[str, Any]) -> list[dict[st
     return reports
 
 
+
+def _research_dashboard(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows = []
+    for item in candidates:
+        correlation_status = item.get("correlation_status", "")
+        rejection = str(item.get("rejection_reason") or "")
+        if correlation_status == "REJECTED_HIGH_CORRELATION":
+            rejection = (rejection + "; " if rejection else "") + "correlation above threshold"
+        accepted = bool(item.get("accepted")) and correlation_status == "ACCEPTED"
+        rows.append({
+            "strategy_name": item.get("label") or item.get("name") or "",
+            "family": item.get("family") or "",
+            "trade_count": int(item.get("trades") or 0),
+            "win_rate": float(item.get("win_rate") or 0),
+            "profit_factor": float(item.get("profit_factor") or 0),
+            "oos_profit_factor": float(item.get("oos_profit_factor") or 0),
+            "expectancy": float(item.get("oos_expectancy", item.get("average_r", 0)) or 0),
+            "maximum_drawdown": float(item.get("max_drawdown_r") or 0),
+            "correlation_score": float(item.get("max_strategy_correlation") or 0),
+            "decision": "ACCEPTED" if accepted else "REJECTED",
+            "reason": "Accepted" if accepted else (rejection or item.get("status") or "Rejected"),
+        })
+    return rows
+
 def build_dashboard(storage: Storage, session_id: str | None = None) -> dict[str, Any]:
     session = storage.get_session(session_id) if session_id else storage.latest_session()
     if not session:
@@ -203,6 +227,7 @@ def build_dashboard(storage: Storage, session_id: str | None = None) -> dict[str
             "last_seen_at": session.get("last_seen_at"),
         },
         "candidate_scores": candidates,
+        "research_dashboard": _research_dashboard(candidates),
         "strategy_snapshot": strategy_snapshot,
         "trade_reports": reports,
         "stats": {

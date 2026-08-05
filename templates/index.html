@@ -128,7 +128,7 @@
 
     <section class="grid">
       <div class="card">
-        <h2>Research ranking</h2>
+        <h2>Research Dashboard</h2>
         <div id="candidateWrap" class="empty">Waiting for the first market-data upload.</div>
       </div>
       <div class="card">
@@ -178,10 +178,13 @@
       }
       $('candidateWrap').className = '';
       $('candidateWrap').innerHTML = `<table>
-        <thead><tr><th>Rank</th><th>Strategy</th><th>Score</th><th>Trades</th><th>Win rate</th><th>Net R</th></tr></thead>
-        <tbody>${rows.map((r,i)=>`<tr>
-          <td>${i+1}</td><td>${esc(r.label)}</td><td>${Number(r.score).toFixed(2)}</td>
-          <td>${r.trades}</td><td>${Number(r.win_rate).toFixed(1)}%</td><td>${Number(r.net_r).toFixed(2)}R</td>
+        <thead><tr><th>Strategy</th><th>Family</th><th>Trades</th><th>Win</th><th>PF</th><th>OOS PF</th><th>Exp.</th><th>DD</th><th>Corr.</th><th>Decision</th><th>Reason</th></tr></thead>
+        <tbody>${rows.map((r)=>`<tr>
+          <td>${esc(r.strategy_name || r.label)}</td><td>${esc(r.family)}</td><td>${r.trade_count ?? r.trades}</td>
+          <td>${Number(r.win_rate || 0).toFixed(1)}%</td><td>${Number(r.profit_factor || 0).toFixed(2)}</td>
+          <td>${Number(r.oos_profit_factor || 0).toFixed(2)}</td><td>${Number(r.expectancy ?? r.oos_expectancy ?? 0).toFixed(3)}R</td>
+          <td>${Number(r.maximum_drawdown ?? r.max_drawdown_r ?? 0).toFixed(2)}R</td><td>${Number(r.correlation_score ?? r.max_strategy_correlation ?? 0).toFixed(2)}</td>
+          <td><span class="badge ${r.decision === 'ACCEPTED' ? 'CLOSED' : 'OPEN'}">${esc(r.decision || r.status || 'REJECTED')}</span></td><td>${esc(r.reason || r.rejection_reason || '')}</td>
         </tr>`).join('')}</tbody></table>`;
     }
 
@@ -266,7 +269,7 @@
       $('profitFactor').textContent=Number(st.profit_factor).toFixed(2);
       $('averageR').textContent=`${Number(st.average_r).toFixed(2)}R`;
       $('openTrades').textContent=st.open_trades;
-      renderCandidates(data.candidate_scores);
+      renderCandidates(data.research_dashboard || data.candidate_scores);
       renderLogs(data.logs);
       renderTrades(data.trade_reports);
     }

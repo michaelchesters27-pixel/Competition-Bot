@@ -12,6 +12,7 @@ SignalFn = Callable[[list[dict[str, Any]], int], dict[str, Any] | None]
 TARGET_PROFIT_FACTOR = 2.10
 MAX_STRATEGY_CORRELATION = 0.72
 MIN_WALK_FORWARD_FOLDS = 3
+MIN_OUT_OF_SAMPLE_TRADES = 200
 ASSUMED_SLIPPAGE_ATR = 0.015
 MIN_SPREAD_ATR = 0.018
 SPREAD_POINT_VALUE = 0.01
@@ -216,13 +217,13 @@ def _execution_cost_r(rows: list[dict[str, Any]], signal_index: int, sl_distance
     return (realistic_spread + slippage) / sl_distance if sl_distance > 0 else 0.0
 
 
-def _trade_result(rows: list[dict[str, Any]], signal_index: int, signal: dict[str, Any], max_hold_bars: int, end_index: int | None = None) -> tuple[float, int, float, float]:
+def _trade_result(rows: list[dict[str, Any]], signal_index: int, signal: dict[str, Any], max_hold_bars: int, end_index: int | None = None, execution_rows: list[dict[str, Any]] | None = None) -> tuple[float, int, float, float, str]:
     entry_index = signal_index + 1
     if entry_index >= len(rows):
-        return 0.0, entry_index, 0.0, 0.0
+        return 0.0, entry_index, 0.0, 0.0, "NO_ENTRY"
     atr_value = finite(rows[signal_index].get("atr"))
     if atr_value <= 0:
-        return 0.0, entry_index, 0.0, 0.0
+        return 0.0, entry_index, 0.0, 0.0, "NO_ATR"
     sl_distance = atr_value * float(signal["sl_atr"])
     tp_distance = atr_value * float(signal["tp_atr"])
     cost_r = _execution_cost_r(rows, signal_index, sl_distance)
@@ -236,19 +237,28 @@ def _trade_result(rows: list[dict[str, Any]], signal_index: int, signal: dict[st
     if end_index is not None:
         last_index = min(last_index, end_index)
     mfe_r = mae_r = 0.0
-    for j in range(entry_index, last_index + 1):
-        high, low = float(rows[j]["high"]), float(rows[j]["low"])
+    execution_source = "M5"
+    scan_rows = rows[entry_index:last_index + 1]
+    if execution_rows:
+        start_time = int(rows[entry_index]["time"])
+        end_time = int(rows[last_index]["time"]) + 300
+        lower = [r for r in execution_rows if start_time <= int(r["time"]) < end_time]
+        if lower:
+            scan_rows = lower
+            execution_source = "M1"
+    for j, scan in enumerate(scan_rows, start=entry_index):
+        high, low = float(scan["high"]), float(scan["low"])
         if action == "BUY":
             mfe_r = max(mfe_r, (high - entry) / sl_distance); mae_r = min(mae_r, (low - entry) / sl_distance)
-            if low <= sl: return -1.0 - cost_r, j, mfe_r, mae_r
-            if high >= tp: return reward_r - cost_r, j, mfe_r, mae_r
+            if low <= sl: return -1.0 - cost_r, j, mfe_r, mae_r, execution_source
+            if high >= tp: return reward_r - cost_r, j, mfe_r, mae_r, execution_source
         else:
             mfe_r = max(mfe_r, (entry - low) / sl_distance); mae_r = min(mae_r, (entry - high) / sl_distance)
-            if high >= sl: return -1.0 - cost_r, j, mfe_r, mae_r
-            if low <= tp: return reward_r - cost_r, j, mfe_r, mae_r
+            if high >= sl: return -1.0 - cost_r, j, mfe_r, mae_r, execution_source
+            if low <= tp: return reward_r - cost_r, j, mfe_r, mae_r, execution_source
     final_close = float(rows[last_index]["close"])
     result_r = (final_close - entry) / sl_distance if action == "BUY" else (entry - final_close) / sl_distance
-    return result_r - cost_r, last_index, mfe_r, mae_r
+    return result_r - cost_r, last_index, mfe_r, mae_r, execution_source
 
 
 def _research_indices(rows: list[dict[str, Any]], start_time: int, end_time: int) -> list[int]:
@@ -279,43 +289,68 @@ def _metrics(trades: list[dict[str, Any]]) -> dict[str, float]:
     return {"profit_factor": pf, "net_r": net, "average_r": net / len(trades) if trades else 0.0, "win_rate": len(wins) / len(trades) * 100 if trades else 0.0, "wins": len(wins), "losses": len(losses)}
 
 
-def _run_trades(candidate: CandidateStrategy, rows: list[dict[str, Any]], allowed: set[int]) -> list[dict[str, Any]]:
+def _run_trades(candidate: CandidateStrategy, rows: list[dict[str, Any]], allowed: set[int], execution_rows: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     trades = []; last_allowed = max(allowed) if allowed else 54; i = 55
     while i < len(rows) - 1:
         if i not in allowed: i += 1; continue
         sig = candidate.signal_fn(rows, i)
         if not sig: i += 1; continue
-        result_r, exit_index, mfe_r, mae_r = _trade_result(rows, i, sig, candidate.max_hold_bars, last_allowed)
-        trades.append({"signal_time": int(rows[i]["time"]), "action": sig["action"], "result_r": result_r, "mfe_r": mfe_r, "mae_r": mae_r, "confidence": sig["confidence"]})
+        result_r, exit_index, mfe_r, mae_r, execution_source = _trade_result(rows, i, sig, candidate.max_hold_bars, last_allowed, execution_rows)
+        trades.append({"signal_time": int(rows[i]["time"]), "action": sig["action"], "result_r": result_r, "mfe_r": mfe_r, "mae_r": mae_r, "confidence": sig["confidence"], "execution_source": execution_source})
         i = max(i + 1, exit_index + 1)
     return trades
 
 
-def _walk_forward(candidate: CandidateStrategy, rows: list[dict[str, Any]], indices: list[int]) -> dict[str, Any]:
-    if len(indices) < MIN_WALK_FORWARD_FOLDS:
-        indices = list(range(55, max(55, len(rows) - 1)))
+def _walk_forward(candidate: CandidateStrategy, rows: list[dict[str, Any]], indices: list[int], execution_rows: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    if len(indices) < MIN_WALK_FORWARD_FOLDS * 3:
+        return {"folds": [], "oos_expectancy": 0.0, "oos_profit_factor": 0.0, "active_folds": 0, "completed": False, "reason": "insufficient historical bars for TRAIN_VALIDATION_TEST"}
     folds = []
-    fold_size = max(1, len(indices) // MIN_WALK_FORWARD_FOLDS)
+    fold_size = max(1, len(indices) // (MIN_WALK_FORWARD_FOLDS + 2))
     for fold in range(MIN_WALK_FORWARD_FOLDS):
-        oos = set(indices[fold * fold_size : (fold + 1) * fold_size] if fold < MIN_WALK_FORWARD_FOLDS - 1 else indices[fold * fold_size :])
-        if not oos: continue
-        trades = _run_trades(candidate, rows, oos)
-        folds.append({"fold": fold + 1, "oos_trades": len(trades), **_metrics(trades)})
+        train_end = (fold + 1) * fold_size
+        validation_end = train_end + fold_size
+        test_end = validation_end + fold_size
+        train = indices[:train_end]
+        validation = indices[train_end:validation_end]
+        test = indices[validation_end:test_end] if fold < MIN_WALK_FORWARD_FOLDS - 1 else indices[validation_end:]
+        if not train or not validation or not test:
+            continue
+        validation_trades = _run_trades(candidate, rows, set(validation), execution_rows)
+        test_trades = _run_trades(candidate, rows, set(test), execution_rows)
+        folds.append({
+            "fold": fold + 1,
+            "train_bars": len(train),
+            "validation_bars": len(validation),
+            "test_bars": len(test),
+            "validation_trades": len(validation_trades),
+            "oos_trades": len(test_trades),
+            "validation": _metrics(validation_trades),
+            **_metrics(test_trades),
+        })
     active = [f for f in folds if f["oos_trades"]]
-    return {"folds": folds, "oos_expectancy": mean(f["average_r"] for f in active) if active else 0.0, "oos_profit_factor": mean(min(10.0, f["profit_factor"]) for f in active) if active else 0.0, "active_folds": len(active)}
+    completed = len(folds) >= MIN_WALK_FORWARD_FOLDS and all(f["train_bars"] and f["validation_bars"] and f["test_bars"] for f in folds)
+    return {"folds": folds, "oos_expectancy": mean(f["average_r"] for f in active) if active else 0.0, "oos_profit_factor": mean(min(10.0, f["profit_factor"]) for f in active) if active else 0.0, "active_folds": len(active), "completed": completed, "reason": "complete" if completed else "incomplete TRAIN_VALIDATION_TEST folds"}
 
 
-def backtest_candidate(candidate: CandidateStrategy, rows: list[dict[str, Any]], start_time: int, end_time: int, regime_name: str) -> dict[str, Any]:
+def backtest_candidate(candidate: CandidateStrategy, rows: list[dict[str, Any]], start_time: int, end_time: int, regime_name: str, execution_rows: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     indices = _research_indices(rows, start_time, end_time)
-    trades = _run_trades(candidate, rows, set(indices))
-    m = _metrics(trades); wf = _walk_forward(candidate, rows, indices)
+    trades = _run_trades(candidate, rows, set(indices), execution_rows)
+    m = _metrics(trades); wf = _walk_forward(candidate, rows, indices, execution_rows)
     dd = equity = peak = 0.0
     for t in trades:
         equity += t["result_r"]; peak = max(peak, equity); dd = max(dd, peak - equity)
     pf_gap = float(wf["oos_profit_factor"]) - TARGET_PROFIT_FACTOR
     score = wf["oos_expectancy"] * 100 + min(float(wf["oos_profit_factor"]), 3.5) * 20 + pf_gap * 25 - dd * 6 + min(len(trades), 8)
     if wf["oos_profit_factor"] < TARGET_PROFIT_FACTOR: score -= (TARGET_PROFIT_FACTOR - float(wf["oos_profit_factor"])) * 45
-    return {"name": candidate.name, "label": candidate.label, "family": candidate.family, "indicators": list(candidate.indicators), "score": round(score, 3), "trades": len(trades), "wins": int(m["wins"]), "losses": int(m["losses"]), "win_rate": round(m["win_rate"], 2), "profit_factor": round(m["profit_factor"], 3), "net_r": round(m["net_r"], 3), "average_r": round(m["average_r"], 3), "oos_expectancy": round(wf["oos_expectancy"], 3), "oos_profit_factor": round(wf["oos_profit_factor"], 3), "profit_factor_target": TARGET_PROFIT_FACTOR, "walk_forward": wf, "max_drawdown_r": round(dd, 3), "max_hold_bars": candidate.max_hold_bars, "trade_examples": trades[-5:]}
+    oos_trades = sum(int(f.get("oos_trades", 0)) for f in wf.get("folds", []))
+    rejection_reasons = []
+    if len(rows) < 120: rejection_reasons.append("insufficient historical data")
+    if not wf.get("completed"): rejection_reasons.append("incomplete walk-forward validation")
+    if oos_trades < MIN_OUT_OF_SAMPLE_TRADES: rejection_reasons.append(f"fewer than {MIN_OUT_OF_SAMPLE_TRADES} completed out-of-sample trades")
+    status = "INSUFFICIENT_EVIDENCE" if rejection_reasons else "ACCEPTED"
+    m1_count = sum(1 for t in trades if t.get("execution_source") == "M1")
+    m5_count = sum(1 for t in trades if t.get("execution_source") == "M5")
+    return {"name": candidate.name, "label": candidate.label, "family": candidate.family, "indicators": list(candidate.indicators), "score": round(score, 3), "status": status, "accepted": status == "ACCEPTED", "rejection_reason": "; ".join(rejection_reasons), "oos_trades": oos_trades, "m1_trade_simulation_count": m1_count, "m5_fallback_trade_simulation_count": m5_count, "trades": len(trades), "wins": int(m["wins"]), "losses": int(m["losses"]), "win_rate": round(m["win_rate"], 2), "profit_factor": round(m["profit_factor"], 3), "net_r": round(m["net_r"], 3), "average_r": round(m["average_r"], 3), "oos_expectancy": round(wf["oos_expectancy"], 3), "oos_profit_factor": round(wf["oos_profit_factor"], 3), "profit_factor_target": TARGET_PROFIT_FACTOR, "walk_forward": wf, "max_drawdown_r": round(dd, 3), "max_hold_bars": candidate.max_hold_bars, "trade_examples": trades[-5:]}
 
 
 def _pearson(a: list[float], b: list[float]) -> float:
@@ -356,13 +391,13 @@ def _indicator_correlation(rows: list[dict[str, Any]], indices: list[int]) -> di
     return out
 
 
-def evaluate_candidates(bars: list[dict[str, Any]], start_time: int | None = None, end_time: int | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+def evaluate_candidates(bars: list[dict[str, Any]], start_time: int | None = None, end_time: int | None = None, execution_bars: list[dict[str, Any]] | None = None, metadata: dict[str, Any] | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     rows = build_feature_rows(bars)
     if not rows: return [], [], {"name": "UNCLASSIFIED"}
     start_time = int(start_time if start_time is not None else rows[max(0, len(rows) - 14)]["time"])
     end_time = int(end_time if end_time is not None else int(rows[-1]["time"]) + 300)
     regime = research_regime(rows, start_time, end_time)
-    results = [backtest_candidate(c, rows, start_time, end_time, str(regime["name"])) for c in CANDIDATES]
+    results = [backtest_candidate(c, rows, start_time, end_time, str(regime["name"]), execution_bars) for c in CANDIDATES]
     results.sort(key=lambda x: (x["correlation_status"] == "ACCEPTED" if "correlation_status" in x else True, x["oos_expectancy"], x["oos_profit_factor"], x["score"]), reverse=True)
     indices = _research_indices(rows, start_time, end_time) or list(range(55, max(55, len(rows) - 1)))
     results = _apply_correlation_filter(results, rows, indices)
@@ -370,25 +405,30 @@ def evaluate_candidates(bars: list[dict[str, Any]], start_time: int | None = Non
     regime["indicator_correlation"] = _indicator_correlation(rows, indices)
     regime["strategy_correlation_threshold"] = MAX_STRATEGY_CORRELATION
     regime["candidate_families_tested"] = len(CANDIDATES)
-    regime["objective"] = "statistically independent strategy families ranked by walk-forward out-of-sample expectancy with PF>2.10 target"
+    regime["objective"] = "statistically rigorous edge discovery using chronological TRAIN_VALIDATION_TEST walk-forward validation"
+    regime["minimum_oos_trades"] = MIN_OUT_OF_SAMPLE_TRADES
+    regime["historical_data"] = metadata or {}
     return results, rows, regime
 
 
-def build_playbook_snapshot(bars: list[dict[str, Any]], research_start: int, research_end: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    rankings, _rows, regime = evaluate_candidates(bars, research_start, research_end)
-    accepted = [r for r in rankings if r.get("correlation_status") == "ACCEPTED"] or rankings
+def build_playbook_snapshot(bars: list[dict[str, Any]], research_start: int, research_end: int, execution_bars: list[dict[str, Any]] | None = None, metadata: dict[str, Any] | None = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    rankings, _rows, regime = evaluate_candidates(bars, research_start, research_end, execution_bars, metadata)
+    accepted = [r for r in rankings if r.get("status") == "ACCEPTED" and r.get("correlation_status") == "ACCEPTED"]
     playbook = [item["name"] for item in accepted[:10]]
     vals = [float(item["oos_expectancy"]) for item in accepted] or [0.0]
     low, high = min(vals), max(vals); span = max(1.0, high - low)
     boosts = {item["name"]: round((float(item["oos_expectancy"]) - low) / span * 5.0, 3) for item in accepted}
-    return rankings, {"selected_at": research_end, "selection_basis": "Walk-forward OOS expectancy, PF>2.10 objective, realistic spread/slippage, and low strategy-correlation family selection", "regime": regime, "playbook": playbook, "research_boosts": boosts, "minimum_confidence": 60.0, "ranking": rankings, "profit_factor_target": TARGET_PROFIT_FACTOR, "max_strategy_correlation": MAX_STRATEGY_CORRELATION}
+    return rankings, {"selected_at": research_end, "selection_basis": "Walk-forward OOS expectancy, PF>2.10 objective, realistic spread/slippage, and low strategy-correlation family selection", "regime": regime, "playbook": playbook, "research_boosts": boosts, "minimum_confidence": 60.0, "ranking": rankings, "accepted_strategy_count": len(accepted), "profit_factor_target": TARGET_PROFIT_FACTOR, "max_strategy_correlation": MAX_STRATEGY_CORRELATION}
 
 
 def evaluate_live_playbook(snapshot: dict[str, Any], bars: list[dict[str, Any]], bid: float, ask: float) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     rows = build_feature_rows(bars)
     if len(rows) < 60: return None, {"decision": "HOLD", "reason": "Insufficient M5 history for indicator calculation"}
     i = len(rows) - 2; row = rows[i]
-    playbook = list(snapshot.get("playbook") or [c.name for c in CANDIDATES]); boosts = dict(snapshot.get("research_boosts") or {}); minimum = float(snapshot.get("minimum_confidence") or 60.0)
+    playbook = list(snapshot.get("playbook") or [])
+    if not playbook:
+        return None, {"decision": "HOLD", "reason": "No strategy met the research acceptance criteria", "accepted_strategy_count": int(snapshot.get("accepted_strategy_count") or 0)}
+    boosts = dict(snapshot.get("research_boosts") or {}); minimum = float(snapshot.get("minimum_confidence") or 60.0)
     evaluated = []
     for rank, name in enumerate(playbook):
         try: c = candidate_by_name(name)
