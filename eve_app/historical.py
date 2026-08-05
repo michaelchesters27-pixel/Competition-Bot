@@ -323,9 +323,11 @@ class SupabaseMarketCandles:
             del chunk
         m5 = normalize_bars(m5)
         source = "STORED_M5"
-        m1_window_provider = (
-            lambda window_start, window_end: self._fetch_window(query_symbol, self.config.m1_value, int(window_start), int(window_end))
-        ) if earliest_m1 is not None else None
+        m1_window_provider = None
+        if earliest_m1 is not None:
+            def m1_window_provider(window_start: int, window_end: int) -> list[Bar]:
+                return self._fetch_window(query_symbol, self.config.m1_value, int(window_start), int(window_end))
+
         valid = bool(m5)
         reason = "OK" if valid else "No completed M5 candles available and M1 fallback unavailable"
         return HistoricalDataset(
