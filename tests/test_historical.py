@@ -57,7 +57,10 @@ def test_candle_time_timestamp_filtering_uses_timestamp_parameters():
         class Conn:
             def __enter__(self): return self
             def __exit__(self, *args): return False
-            def transaction(self, read_only=True): return Tx()
+            def transaction(self, *args, **kwargs):
+                assert args == ()
+                assert kwargs == {}
+                return Tx()
             def execute(self, sql, params=None):
                 if params and "start_time" in params:
                     captured.update(params)
@@ -71,6 +74,41 @@ def test_candle_time_timestamp_filtering_uses_timestamp_parameters():
     assert isinstance(captured["start_time"], datetime)
     assert captured["start_time"].tzinfo is not None
     assert isinstance(captured["end_time"], datetime)
+
+
+def test_historical_transactions_do_not_pass_read_only_keyword():
+    config = HistoricalConfig(database_url="postgresql://reader@example/db")
+    source = _source(config)
+    transaction_kwargs = []
+
+    class Tx:
+        def __enter__(self): return None
+        def __exit__(self, *args): return False
+
+    class Rows:
+        def __init__(self, row=None):
+            self.row = row
+        def fetchall(self): return []
+        def fetchone(self): return self.row
+
+    class Conn:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def transaction(self, *args, **kwargs):
+            transaction_kwargs.append(kwargs)
+            if "read_only" in kwargs:
+                raise TypeError("Connection.transaction() got an unexpected keyword argument 'read_only'")
+            return Tx()
+        def execute(self, sql, params=None):
+            if "MIN" in sql:
+                return Rows({"earliest_time": None})
+            return Rows()
+
+    source._connect = lambda: Conn()
+
+    source._fetch("XAUUSD", "M5", 1_700_000_000, 1_700_086_400)
+    assert source.earliest_time("XAUUSD", "M5") is None
+    assert transaction_kwargs == [{}, {}]
 
 
 def test_completed_candles_only_are_loaded():
@@ -91,6 +129,127 @@ def test_historical_pagination_loads_date_chunks_chronologically():
     rows = source._fetch_chunked("XAUUSD", "M5", 0, 3 * 86400)
     assert calls == [(0, 86400), (86400, 172800), (172800, 259200)]
     assert [row["time"] for row in rows] == [0, 86400, 172800]
+
+
+def test_xauusd_request_falls_back_to_slash_symbol_when_db_uses_xau_slash_usd():
+    config = HistoricalConfig(database_url="postgresql://reader@example/db", m5_value="5min", m1_value="1min")
+    source = _source(config)
+    earliest_calls = []
+    fetch_calls = []
+
+    def fake_earliest(symbol, timeframe):
+        earliest_calls.append((symbol, timeframe))
+        if symbol == "XAU/USD" and timeframe == "5min":
+            return 1_584_324_600
+        return None
+
+    def fake_fetch_chunked(symbol, timeframe, start_ts, end_ts):
+        fetch_calls.append((symbol, timeframe, start_ts, end_ts))
+        if symbol == "XAU/USD" and timeframe == "5min":
+            return [{"time": start_ts, "open": 1, "high": 2, "low": 0, "close": 1, "tick_volume": 1, "spread": 0}]
+        return []
+
+    source.earliest_time = fake_earliest
+    source._fetch_chunked = fake_fetch_chunked
+
+    dataset = source.get_research_dataset("XAUUSD", 1_584_324_900)
+
+    assert dataset.valid
+    assert earliest_calls == [("XAUUSD", "5min"), ("XAUUSD", "1min"), ("XAU/USD", "5min"), ("XAU/USD", "1min")]
+    assert fetch_calls == [("XAU/USD", "5min", 1_584_324_600, 1_584_324_900), ("XAU/USD", "1min", 1_584_324_600, 1_584_324_900)]
+    assert dataset.metadata["query_symbol"] == "XAU/USD"
+    assert dataset.metadata["earliest_m5"] == 1_584_324_600
+    assert dataset.metadata["m5_bars"] == 1
+
+
+def test_symbol_value_override_is_used_for_historical_queries():
+    config = HistoricalConfig(database_url="postgresql://reader@example/db", symbol_value="XAU/USD", m5_value="5min", m1_value="1min")
+    source = _source(config)
+    earliest_calls = []
+    fetch_calls = []
+
+    def fake_earliest(symbol, timeframe):
+        earliest_calls.append((symbol, timeframe))
+        return 1_700_000_000 if timeframe == "5min" else None
+
+    def fake_fetch_chunked(symbol, timeframe, start_ts, end_ts):
+        fetch_calls.append((symbol, timeframe, start_ts, end_ts))
+        if timeframe == "5min":
+            return [{"time": start_ts, "open": 1, "high": 2, "low": 0, "close": 1, "tick_volume": 1, "spread": 0}]
+        return []
+
+    source.earliest_time = fake_earliest
+    source._fetch_chunked = fake_fetch_chunked
+
+    dataset = source.get_research_dataset("XAUUSD", 1_700_000_300)
+
+    assert dataset.valid
+    assert earliest_calls == [("XAU/USD", "5min"), ("XAU/USD", "1min")]
+    assert fetch_calls == [("XAU/USD", "5min", 1_700_000_000, 1_700_000_300), ("XAU/USD", "1min", 1_700_000_000, 1_700_000_300)]
+    assert dataset.metadata["requested_symbol"] == "XAUUSD"
+    assert dataset.metadata["query_symbol"] == "XAU/USD"
+    assert dataset.metadata["m5_interval"] == "5min"
+    assert dataset.metadata["m1_interval"] == "1min"
+    assert dataset.metadata["earliest_m5"] == 1_700_000_000
+    assert dataset.metadata["earliest_m1"] is None
+    assert dataset.metadata["m5_bars"] == 1
+    assert dataset.metadata["m1_bars"] == 0
+    assert dataset.metadata["reason"] == "OK"
+
+
+def test_invalid_historical_dataset_reports_query_diagnostics():
+    config = HistoricalConfig(database_url="postgresql://reader@example/db", symbol_value="XAU/USD", m5_value="5min", m1_value="1min")
+    source = _source(config)
+    source.earliest_time = lambda symbol, timeframe: None
+
+    dataset = source.get_research_dataset("XAUUSD", 1_700_000_300)
+
+    assert not dataset.valid
+    assert dataset.metadata["valid"] is False
+    assert dataset.metadata["query_symbol"] == "XAU/USD"
+    assert dataset.metadata["requested_symbol"] == "XAUUSD"
+    assert dataset.metadata["earliest_m5"] is None
+    assert dataset.metadata["earliest_m1"] is None
+    assert dataset.metadata["m5_bars"] == 0
+    assert dataset.metadata["m1_bars"] == 0
+    assert "XAU/USD" in dataset.metadata["reason"]
+    assert "5min" in dataset.metadata["reason"]
+    assert "1min" in dataset.metadata["reason"]
+
+
+def test_engine_logs_actual_invalid_historical_reason(tmp_path):
+    class InvalidSource:
+        def get_research_dataset(self, symbol, end_ts):
+            return HistoricalDataset(
+                m5_bars=[],
+                m1_bars=[],
+                metadata={
+                    "valid": False,
+                    "reason": "No completed historical candles found for symbol='XAU/USD', M5 interval='5min', M1 interval='1min'",
+                    "earliest_m5": None,
+                    "earliest_m1": None,
+                    "m5_bars": 0,
+                    "m1_bars": 0,
+                },
+            )
+
+    storage = Storage(str(tmp_path / "test.db"))
+    engine = CompetitionEngine(storage, InvalidSource())
+    started = engine.start_or_resume("12345", "XAUUSD", "M5", "launch-a")
+    session = storage.get_session(started["session_id"])
+    assert session is not None
+    bars = synthetic_bars(start=int(session["started_at"]) - 408 * 300)
+
+    result = engine.process_pulse({"session_id": started["session_id"], "bid": bars[-1]["close"], "ask": bars[-1]["close"] + 0.1, "bars": bars})
+
+    assert result["action"] == "HOLD"
+    logs = storage.session_logs(started["session_id"], limit=10)
+    unavailable = next(log for log in logs if log["event"] == "HISTORICAL_DATA_UNAVAILABLE")
+    assert unavailable["message"] == "Historical dataset rejected: No completed historical candles found for symbol='XAU/USD', M5 interval='5min', M1 interval='1min'"
+    assert unavailable["details"]["earliest_m5"] is None
+    assert unavailable["details"]["earliest_m1"] is None
+    assert unavailable["details"]["m5_bars"] == 0
+    assert unavailable["details"]["m1_bars"] == 0
 
 
 def test_builds_m5_from_m1_only_as_fallback_helper():

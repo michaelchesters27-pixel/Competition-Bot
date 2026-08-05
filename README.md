@@ -84,6 +84,7 @@ Add the read-only historical candle database variable:
 Optional historical configuration:
 
 - `EVE_MARKET_CANDLES_TABLE` — defaults to `public.market_candles`
+- `EVE_MARKET_CANDLES_SYMBOL` — optional database symbol override, for example `XAU/USD` when MT5 sends `XAUUSD`
 - `EVE_HISTORICAL_LOOKBACK_DAYS` — optional cap on history; unset means use all available candles
 - `EVE_HISTORICAL_QUERY_TIMEOUT_SECONDS` — defaults to `20`
 - `EVE_HISTORICAL_ENABLED` — defaults to `true`

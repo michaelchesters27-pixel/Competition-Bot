@@ -37,11 +37,36 @@ def _floor_m5(timestamp: int) -> int:
     return timestamp - timestamp % 300
 
 
+def _dedupe(values: Iterable[str]) -> list[str]:
+    out = []
+    seen = set()
+    for value in values:
+        text = str(value).strip()
+        if text and text not in seen:
+            out.append(text)
+            seen.add(text)
+    return out
+
+
+def _symbol_variants(requested_symbol: str, configured_symbol: str = "") -> list[str]:
+    requested = str(requested_symbol).strip()
+    upper = requested.upper()
+    variants = [configured_symbol, requested]
+    if upper.startswith("XAUUSD"):
+        suffix = requested[6:]
+        variants.append(f"XAU/USD{suffix}")
+    if upper.startswith("XAU/USD"):
+        suffix = requested[7:]
+        variants.append(f"XAUUSD{suffix}")
+    return _dedupe(variants)
+
+
 @dataclass(frozen=True)
 class HistoricalConfig:
     database_url: str
     table: str = "public.market_candles"
     symbol_column: str = "symbol"
+    symbol_value: str = ""
     timeframe_column: str = "interval"
     time_column: str = "candle_time"
     open_column: str = "open"
@@ -73,6 +98,7 @@ class HistoricalConfig:
             database_url=url,
             table=_env("EVE_MARKET_CANDLES_TABLE", "public.market_candles"),
             symbol_column=_env("EVE_MARKET_CANDLES_SYMBOL_COLUMN", "symbol"),
+            symbol_value=_env("EVE_MARKET_CANDLES_SYMBOL", ""),
             timeframe_column=_env("EVE_MARKET_CANDLES_TIMEFRAME_COLUMN", "interval"),
             time_column=_env("EVE_MARKET_CANDLES_TIME_COLUMN", "candle_time"),
             open_column=_env("EVE_MARKET_CANDLES_OPEN_COLUMN", "open"),
@@ -167,7 +193,7 @@ class SupabaseMarketCandles:
         with self._connect() as conn:
             conn.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
             conn.execute("SET statement_timeout = %s", (self.config.timeout_seconds * 1000,))
-            with conn.transaction(read_only=True):
+            with conn.transaction():
                 rows = conn.execute(self._select_sql(use_source_filter), params).fetchall()
         return normalize_bars(rows)
 
@@ -182,7 +208,7 @@ class SupabaseMarketCandles:
         """
         with self._connect() as conn:
             conn.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
-            with conn.transaction(read_only=True):
+            with conn.transaction():
                 row = conn.execute(sql, {"symbol": symbol, "timeframe": timeframe}).fetchone()
         return _ts(row["earliest_time"]) if row and row.get("earliest_time") else None
 
@@ -200,28 +226,66 @@ class SupabaseMarketCandles:
         return normalize_bars(out)
 
     def get_research_dataset(self, symbol: str, end_ts: int) -> HistoricalDataset:
-        earliest_m5 = self.earliest_time(symbol, self.config.m5_value)
-        earliest_m1 = self.earliest_time(symbol, self.config.m1_value)
-        earliest = min([t for t in (earliest_m5, earliest_m1) if t is not None], default=None)
+        query_symbol = _symbol_variants(symbol, self.config.symbol_value)[0]
+        earliest_m5 = None
+        earliest_m1 = None
+        earliest = None
+        for candidate_symbol in _symbol_variants(symbol, self.config.symbol_value):
+            candidate_m5 = self.earliest_time(candidate_symbol, self.config.m5_value)
+            candidate_m1 = self.earliest_time(candidate_symbol, self.config.m1_value)
+            candidate_earliest = min([t for t in (candidate_m5, candidate_m1) if t is not None], default=None)
+            if candidate_earliest is not None:
+                query_symbol = candidate_symbol
+                earliest_m5 = candidate_m5
+                earliest_m1 = candidate_m1
+                earliest = candidate_earliest
+                break
         if earliest is None:
-            return HistoricalDataset([], [], {"valid": False, "reason": "No completed historical candles found", "source_table": self.config.table})
+            reason = (
+                f"No completed historical candles found for symbol={query_symbol!r}, "
+                f"M5 interval={self.config.m5_value!r}, M1 interval={self.config.m1_value!r}"
+            )
+            return HistoricalDataset(
+                [],
+                [],
+                {
+                    "valid": False,
+                    "reason": reason,
+                    "source_table": self.config.table,
+                    "requested_symbol": symbol,
+                    "query_symbol": query_symbol,
+                    "m5_interval": self.config.m5_value,
+                    "m1_interval": self.config.m1_value,
+                    "earliest_m5": earliest_m5,
+                    "earliest_m1": earliest_m1,
+                    "m5_bars": 0,
+                    "m1_bars": 0,
+                },
+            )
         start_ts = earliest
         if self.config.lookback_days is not None:
             start_ts = max(start_ts, end_ts - self.config.lookback_days * 86400)
-        m5 = self._fetch_chunked(symbol, self.config.m5_value, start_ts, end_ts)
-        m1 = self._fetch_chunked(symbol, self.config.m1_value, start_ts, end_ts)
+        m5 = self._fetch_chunked(query_symbol, self.config.m5_value, start_ts, end_ts)
+        m1 = self._fetch_chunked(query_symbol, self.config.m1_value, start_ts, end_ts)
         source = "STORED_M5"
         if not m5 and m1:
             m5 = build_m5_from_m1(m1)
             source = "BUILT_FROM_M1_FALLBACK"
         valid = bool(m5)
+        reason = "OK" if valid else "No completed M5 candles available and M1 fallback unavailable"
         return HistoricalDataset(
             m5_bars=m5,
             m1_bars=m1,
             metadata={
                 "valid": valid,
-                "reason": "OK" if valid else "No completed M5 candles available and M1 fallback unavailable",
+                "reason": reason,
                 "source_table": self.config.table,
+                "requested_symbol": symbol,
+                "query_symbol": query_symbol,
+                "m5_interval": self.config.m5_value,
+                "m1_interval": self.config.m1_value,
+                "earliest_m5": earliest_m5,
+                "earliest_m1": earliest_m1,
                 "m5_source": source,
                 "m1_available": bool(m1),
                 "spread_source": "COLUMN" if self.config.spread_column else "ASSUMED",
