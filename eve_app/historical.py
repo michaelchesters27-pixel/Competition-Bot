@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable
 
-from .memory import bounded_tail
 from urllib.parse import urlparse
 
 Bar = dict[str, Any]
@@ -105,7 +104,7 @@ class HistoricalConfig:
             lookback_days=lookback_days,
             chunk_days=max(1, int(_env("EVE_HISTORICAL_CHUNK_DAYS", "30"))),
             timeout_seconds=int(_env("EVE_HISTORICAL_QUERY_TIMEOUT_SECONDS", "20")),
-            max_m5_bars=max(120, int(_env("EVE_HISTORICAL_MAX_M5_BARS", "5000"))),
+            max_m5_bars=min(5000, max(120, int(_env("EVE_HISTORICAL_MAX_M5_BARS", "5000")))),
             enabled=enabled,
         )
 
@@ -152,7 +151,7 @@ class SupabaseMarketCandles:
             raise ValueError("Historical candle table must be table or schema.table")
         return ".".join(cls._safe_identifier(part) for part in parts)
 
-    def _select_sql(self, use_source_filter: bool = True) -> str:
+    def _selected_columns_sql(self) -> str:
         c = self.config
         cols = {
             "time": c.time_column,
@@ -167,9 +166,13 @@ class SupabaseMarketCandles:
             selected.append(f"{self._safe_identifier(c.spread_column)} AS {self._safe_identifier('spread')}")
         else:
             selected.append(f"0::double precision AS {self._safe_identifier('spread')}")
+        return ",".join(selected)
+
+    def _select_sql(self, use_source_filter: bool = True) -> str:
+        c = self.config
         source_clause = f"\n              AND {self._safe_identifier(c.source_column)} = %(source)s" if use_source_filter and c.filter_preferred_source else ""
         return f"""
-            SELECT {','.join(selected)}
+            SELECT {self._selected_columns_sql()}
             FROM {self._table}
             WHERE {self._safe_identifier(c.symbol_column)} = %(symbol)s
               AND {self._safe_identifier(c.timeframe_column)} = %(timeframe)s
@@ -177,6 +180,25 @@ class SupabaseMarketCandles:
               AND {self._safe_identifier(c.time_column)} >= %(start_time)s
               AND {self._safe_identifier(c.time_column)} < %(end_time)s{source_clause}
             ORDER BY {self._safe_identifier(c.time_column)} ASC
+        """
+
+    def _select_latest_m5_sql(self, use_source_filter: bool = True) -> str:
+        c = self.config
+        source_clause = f"\n              AND {self._safe_identifier(c.source_column)} = %(source)s" if use_source_filter and c.filter_preferred_source else ""
+        lookback_clause = (
+            f"\n              AND {self._safe_identifier(c.time_column)} >= %(start_time)s"
+            if c.lookback_days is not None
+            else ""
+        )
+        return f"""
+            SELECT {self._selected_columns_sql()}
+            FROM {self._table}
+            WHERE {self._safe_identifier(c.symbol_column)} = %(symbol)s
+              AND {self._safe_identifier(c.timeframe_column)} = %(timeframe)s
+              AND {self._safe_identifier(c.complete_column)} = true
+              AND {self._safe_identifier(c.time_column)} < %(end_time)s{lookback_clause}{source_clause}
+            ORDER BY {self._safe_identifier(c.time_column)} DESC
+            LIMIT %(limit)s
         """
 
     def _connect(self):
@@ -197,6 +219,24 @@ class SupabaseMarketCandles:
             with conn.transaction():
                 rows = conn.execute(self._select_sql(use_source_filter), params).fetchall()
         return normalize_bars(rows)
+
+    def _fetch_latest_completed_m5(self, symbol: str, end_ts: int, use_source_filter: bool = True) -> list[Bar]:
+        params = {
+            "symbol": symbol,
+            "timeframe": self.config.m5_value,
+            "source": self.config.preferred_source,
+            "end_time": _dt(end_ts),
+            "limit": min(5000, int(self.config.max_m5_bars)),
+        }
+        if self.config.lookback_days is not None:
+            params["start_time"] = _dt(end_ts - self.config.lookback_days * 86400)
+        with self._connect() as conn:
+            conn.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
+            timeout_ms = max(0, int(self.config.timeout_seconds) * 1000)
+            conn.execute(f"SET statement_timeout = {timeout_ms}")
+            with conn.transaction():
+                rows = conn.execute(self._select_latest_m5_sql(use_source_filter), params).fetchall()
+        return normalize_bars(reversed(rows))
 
     def earliest_time(self, symbol: str, timeframe: str) -> int | None:
         c = self.config
@@ -307,25 +347,20 @@ class SupabaseMarketCandles:
                     "m1_bars": 0,
                 },
             )
-        start_ts = earliest_m5 if earliest_m5 is not None else earliest
-        if self.config.lookback_days is not None:
-            start_ts = max(start_ts, end_ts - self.config.lookback_days * 86400)
-        m5: list[Bar] = []
-        processed = 0
-        for chunk in self._iter_chunks(query_symbol, self.config.m5_value, start_ts, end_ts):
-            m5 = bounded_tail([*m5, *chunk], self.config.max_m5_bars)
-            processed += len(chunk)
-            logger.info(
-                "historical research progress",
-                extra={
-                    "m5_candles_processed": processed,
-                    "current_date_range": f"{_dt(start_ts).date().isoformat()} to {_dt(end_ts).date().isoformat()}",
-                    "strategies_completed": 0,
-                    "configured_chunk_days": self.config.chunk_days,
-                },
-            )
-            del chunk
-        m5 = normalize_bars(m5)
+        m5 = self._fetch_latest_completed_m5(query_symbol, end_ts, use_source_filter=True)
+        if not m5 and self.config.filter_preferred_source:
+            m5 = self._fetch_latest_completed_m5(query_symbol, end_ts, use_source_filter=False)
+        processed = len(m5)
+        start_ts = int(m5[0]["time"]) if m5 else (earliest_m5 if earliest_m5 is not None else earliest)
+        logger.info(
+            "historical research progress",
+            extra={
+                "m5_candles_processed": processed,
+                "current_date_range": f"{_dt(start_ts).date().isoformat()} to {_dt(end_ts).date().isoformat()}",
+                "strategies_completed": 0,
+                "configured_chunk_days": self.config.chunk_days,
+            },
+        )
         source = "STORED_M5"
         m1_window_provider = None
         if earliest_m1 is not None:
