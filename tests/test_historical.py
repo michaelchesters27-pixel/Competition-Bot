@@ -265,20 +265,21 @@ def test_symbol_value_override_is_used_for_historical_queries():
         earliest_calls.append((symbol, timeframe))
         return 1_700_000_000 if timeframe == "5min" else None
 
-    def fake_fetch_chunked(symbol, timeframe, start_ts, end_ts):
+    def fake_iter_chunks(symbol, timeframe, start_ts, end_ts):
         fetch_calls.append((symbol, timeframe, start_ts, end_ts))
         if timeframe == "5min":
-            return [{"time": start_ts, "open": 1, "high": 2, "low": 0, "close": 1, "tick_volume": 1, "spread": 0}]
-        return []
+            yield [{"time": start_ts, "open": 1, "high": 2, "low": 0, "close": 1, "tick_volume": 1, "spread": 0}]
+        else:
+            yield []
 
     source.earliest_time = fake_earliest
-    source._fetch_chunked = fake_fetch_chunked
+    source._iter_chunks = fake_iter_chunks
 
     dataset = source.get_research_dataset("XAUUSD", 1_700_000_300)
 
     assert dataset.valid
     assert earliest_calls == [("XAU/USD", "5min"), ("XAU/USD", "1min")]
-    assert fetch_calls == [("XAU/USD", "5min", 1_700_000_000, 1_700_000_300), ("XAU/USD", "1min", 1_700_000_000, 1_700_000_300)]
+    assert fetch_calls == [("XAU/USD", "5min", 1_700_000_000, 1_700_000_300)]
     assert dataset.metadata["requested_symbol"] == "XAUUSD"
     assert dataset.metadata["query_symbol"] == "XAU/USD"
     assert dataset.metadata["m5_interval"] == "5min"
@@ -302,24 +303,51 @@ def test_xauusd_falls_back_to_slash_symbol_for_historical_queries():
             return 1_700_000_000
         return None
 
-    def fake_fetch_chunked(symbol, timeframe, start_ts, end_ts):
+    def fake_iter_chunks(symbol, timeframe, start_ts, end_ts):
         fetch_calls.append((symbol, timeframe, start_ts, end_ts))
         if symbol == "XAU/USD" and timeframe == "5min":
-            return [{"time": start_ts, "open": 1, "high": 2, "low": 0, "close": 1, "tick_volume": 1, "spread": 0}]
-        return []
+            yield [{"time": start_ts, "open": 1, "high": 2, "low": 0, "close": 1, "tick_volume": 1, "spread": 0}]
+        else:
+            yield []
 
     source.earliest_time = fake_earliest
-    source._fetch_chunked = fake_fetch_chunked
+    source._iter_chunks = fake_iter_chunks
 
     dataset = source.get_research_dataset("XAUUSD", 1_700_000_300)
 
     assert dataset.valid
     assert earliest_calls == [("XAUUSD", "5min"), ("XAUUSD", "1min"), ("XAU/USD", "5min"), ("XAU/USD", "1min")]
-    assert fetch_calls == [("XAU/USD", "5min", 1_700_000_000, 1_700_000_300), ("XAU/USD", "1min", 1_700_000_000, 1_700_000_300)]
+    assert fetch_calls == [("XAU/USD", "5min", 1_700_000_000, 1_700_000_300)]
     assert dataset.metadata["requested_symbol"] == "XAUUSD"
     assert dataset.metadata["query_symbol"] == "XAU/USD"
     assert dataset.metadata["earliest_m5"] == 1_700_000_000
     assert dataset.metadata["earliest_m1"] is None
+
+
+def test_research_dataset_does_not_retain_complete_m1_history():
+    config = HistoricalConfig(database_url="postgresql://reader@example/db", symbol_value="XAU/USD", m5_value="5min", m1_value="1min")
+    source = _source(config)
+    source.earliest_time = lambda symbol, timeframe: 1_700_000_000
+    fetch_calls = []
+
+    def fake_fetch(symbol, timeframe, start_ts, end_ts, use_source_filter=True):
+        fetch_calls.append((timeframe, start_ts, end_ts))
+        return [{"time": start_ts, "open": 1, "high": 2, "low": 0, "close": 1, "tick_volume": 1, "spread": 0}]
+
+    source._fetch = fake_fetch
+
+    dataset = source.get_research_dataset("XAUUSD", 1_700_000_300)
+
+    assert dataset.valid
+    assert dataset.m1_bars == []
+    assert dataset.metadata["m1_bars"] == 0
+    assert dataset.metadata["m1_loading_mode"] == "ON_DEMAND_WINDOWS"
+    assert [call[0] for call in fetch_calls] == ["5min"]
+
+    assert dataset.m1_window_provider is not None
+    window = dataset.m1_window_provider(1_700_000_060, 1_700_000_180)
+    assert len(window) == 1
+    assert fetch_calls[-1] == ("1min", 1_700_000_060, 1_700_000_180)
 
 
 def test_invalid_historical_dataset_reports_query_diagnostics():

@@ -215,9 +215,8 @@ def candle_body_ratio(bar: dict[str, Any]) -> float:
 def recent_breakout(bars: list[dict[str, Any]], index: int, lookback: int = 6) -> tuple[bool, bool]:
     if index < lookback:
         return False, False
-    prior = bars[index - lookback : index]
-    prior_high = max(float(b["high"]) for b in prior)
-    prior_low = min(float(b["low"]) for b in prior)
+    prior_high = max(float(bars[j]["high"]) for j in range(index - lookback, index))
+    prior_low = min(float(bars[j]["low"]) for j in range(index - lookback, index))
     close = float(bars[index]["close"])
     return close > prior_high, close < prior_low
 
@@ -250,9 +249,8 @@ def build_feature_rows(bars: list[dict[str, Any]]) -> list[dict[str, Any]]:
             if cv[i] is not None and cv[i - 1] is not None:
                 cv_delta = float(cv[i]) - float(cv[i - 1])
 
-        rows.append(
+        bar.update(
             {
-                **bar,
                 "t3_fast": t3_fast[i],
                 "t3_slow": t3_slow[i],
                 "t3_fast_slope": fast_slope,
@@ -269,6 +267,7 @@ def build_feature_rows(bars: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "breakout_down": down_break,
             }
         )
+        rows.append(bar)
     return rows
 
 

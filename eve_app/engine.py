@@ -123,7 +123,7 @@ class CompetitionEngine:
                     return self._pulse_payload(session, phase_state(session), None)
                 research_start = int(dataset.m5_bars[0]["time"])
                 scores, _rows, regime = evaluate_candidates(
-                    dataset.m5_bars, research_start, evaluation_end, dataset.m1_bars, dataset.metadata
+                    dataset.m5_bars, research_start, evaluation_end, dataset.m1_window_provider or dataset.m1_bars, dataset.metadata
                 )
                 self.storage.save_candidate_scores(session_id, scores)
                 self.storage.touch_session(session_id, closed_bar_time)
@@ -159,7 +159,7 @@ class CompetitionEngine:
                     dataset.m5_bars,
                     research_start,
                     int(session["research_ends_at"]),
-                    dataset.m1_bars,
+                    dataset.m1_window_provider or dataset.m1_bars,
                     dataset.metadata,
                 )
                 self.storage.save_candidate_scores(session_id, rankings)
