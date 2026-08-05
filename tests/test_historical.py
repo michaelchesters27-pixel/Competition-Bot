@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+import time
 
 import pytest
 
@@ -403,7 +404,13 @@ def test_engine_logs_actual_invalid_historical_reason(tmp_path):
     result = engine.process_pulse({"session_id": started["session_id"], "bid": bars[-1]["close"], "ask": bars[-1]["close"] + 0.1, "bars": bars})
 
     assert result["action"] == "HOLD"
-    logs = storage.session_logs(started["session_id"], limit=10)
+    deadline = time.time() + 5
+    logs = []
+    while time.time() < deadline:
+        logs = storage.session_logs(started["session_id"], limit=10)
+        if any(log["event"] == "HISTORICAL_DATA_UNAVAILABLE" for log in logs):
+            break
+        time.sleep(0.05)
     unavailable = next(log for log in logs if log["event"] == "HISTORICAL_DATA_UNAVAILABLE")
     assert unavailable["message"] == "Historical dataset rejected: No completed historical candles found for symbol='XAU/USD', M5 interval='5min', M1 interval='1min'"
     assert unavailable["details"]["earliest_m5"] is None
@@ -464,7 +471,13 @@ def test_failed_historical_connection_cannot_promote_strategy(tmp_path):
     result = engine.process_pulse({"session_id": started["session_id"], "bid": bars[-1]["close"], "ask": bars[-1]["close"] + 0.1, "bars": bars})
     assert result["action"] == "HOLD"
     assert storage.latest_candidate_scores(started["session_id"]) == []
-    logs = storage.session_logs(started["session_id"], limit=10)
+    deadline = time.time() + 5
+    logs = []
+    while time.time() < deadline:
+        logs = storage.session_logs(started["session_id"], limit=10)
+        if any(log["event"] == "HISTORICAL_DATA_UNAVAILABLE" for log in logs):
+            break
+        time.sleep(0.05)
     assert any(log["event"] == "HISTORICAL_DATA_UNAVAILABLE" for log in logs)
 
 

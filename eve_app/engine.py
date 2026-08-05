@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import dataclass
 from typing import Any
 
@@ -33,6 +34,8 @@ def phase_state(session: dict[str, Any], now: int | None = None) -> PhaseState:
 class CompetitionEngine:
     def __init__(self, storage: Storage, historical_source: SupabaseMarketCandles | None = None) -> None:
         self.storage = storage
+        self._research_lock = threading.RLock()
+        self._research_jobs: dict[str, threading.Thread] = {}
         if historical_source is not None:
             self.historical_source = historical_source
         else:
@@ -117,32 +120,8 @@ class CompetitionEngine:
 
         if phase.phase == "RESEARCH":
             if closed_bar_time and closed_bar_time != session.get("last_bar_time") and len(stored_bars) >= 80:
-                evaluation_end = min(utc_now_ts(), int(session["research_ends_at"]))
-                dataset = self._historical_dataset(session, stored_bars, evaluation_end)
-                if not dataset.valid:
-                    self.storage.touch_session(session_id, closed_bar_time)
-                    return self._pulse_payload(session, phase_state(session), None)
-                research_start = int(dataset.m5_bars[0]["time"])
-                scores, _rows, regime = evaluate_candidates(
-                    dataset.m5_bars, research_start, evaluation_end, dataset.m1_window_provider or dataset.m1_bars, dataset.metadata
-                )
-                self.storage.save_candidate_scores(session_id, scores)
+                self._start_research_job(session_id, closed_bar_time, freeze_playbook=False)
                 self.storage.touch_session(session_id, closed_bar_time)
-                leader = scores[0] if scores else None
-                if leader:
-                    self.storage.add_log(
-                        session_id,
-                        "RESEARCH_UPDATE",
-                        f"Research updated. Regime: {regime['name']}. Current playbook leader: {leader['label']}.",
-                        details={
-                            "leader": leader["name"],
-                            "score": leader["score"],
-                            "research_trades": leader["trades"],
-                            "net_r": leader["net_r"],
-                            "regime": regime,
-                            "historical_data": dataset.metadata,
-                        },
-                    )
             else:
                 self.storage.touch_session(session_id)
 
@@ -151,35 +130,9 @@ class CompetitionEngine:
 
         if phase.phase in ("TRADING", "COMPLETE") and not session.get("selected_strategy"):
             if len(stored_bars) >= 80:
-                dataset = self._historical_dataset(session, stored_bars, int(session["research_ends_at"]))
-                if not dataset.valid:
-                    self.storage.touch_session(session_id)
-                    return self._pulse_payload(session, phase_state(session), None)
-                research_start = int(dataset.m5_bars[0]["time"])
-                rankings, snapshot = build_playbook_snapshot(
-                    dataset.m5_bars,
-                    research_start,
-                    int(session["research_ends_at"]),
-                    dataset.m1_window_provider or dataset.m1_bars,
-                    dataset.metadata,
-                )
-                self.storage.save_candidate_scores(session_id, rankings)
-                self.storage.set_selected_strategy(session_id, "adaptive_research_playbook", snapshot)
-                top_labels = [item["label"] for item in rankings[:3]]
-                self.storage.add_log(
-                    session_id,
-                    "PLAYBOOK_FROZEN",
-                    "Research finished. A ranked multi-strategy playbook was frozen instead of relying on one rare trigger.",
-                    details={
-                        "regime": snapshot.get("regime"),
-                        "top_modules": top_labels,
-                        "playbook": snapshot.get("playbook"),
-                        "accepted_strategy_count": snapshot.get("accepted_strategy_count"),
-                        "minimum_confidence": snapshot.get("minimum_confidence"),
-                        "historical_data": dataset.metadata,
-                    },
-                )
-                session = self.storage.get_session(session_id) or session
+                self._start_research_job(session_id, closed_bar_time, freeze_playbook=True)
+            self.storage.touch_session(session_id, closed_bar_time)
+            return self._pulse_payload(self.storage.get_session(session_id) or session, phase_state(session), None)
 
         pending = self.storage.pending_signal(session_id)
         if pending:
@@ -246,6 +199,130 @@ class CompetitionEngine:
 
         self.storage.touch_session(session_id)
         return self._pulse_payload(self.storage.get_session(session_id) or session, phase_state(session), None)
+
+
+    def _start_research_job(self, session_id: str, closed_bar_time: int | None, freeze_playbook: bool) -> bool:
+        with self._research_lock:
+            thread = self._research_jobs.get(session_id)
+            if thread and thread.is_alive():
+                return False
+            self._research_jobs.pop(session_id, None)
+            thread = threading.Thread(
+                target=self._run_research_job,
+                args=(session_id, closed_bar_time, freeze_playbook),
+                name=f"research-{session_id}",
+                daemon=True,
+            )
+            self._research_jobs[session_id] = thread
+            thread.start()
+            return True
+
+    def _finish_research_job(self, session_id: str) -> None:
+        with self._research_lock:
+            self._research_jobs.pop(session_id, None)
+
+    def _run_research_job(self, session_id: str, closed_bar_time: int | None, freeze_playbook: bool) -> None:
+        try:
+            session = self.storage.get_session(session_id)
+            if not session:
+                return
+            evaluation_end = int(session["research_ends_at"]) if freeze_playbook else min(utc_now_ts(), int(session["research_ends_at"]))
+            self.storage.add_log(
+                session_id,
+                "RESEARCH_JOB_STARTED",
+                "Background research job started.",
+                details={"closed_bar_time": closed_bar_time, "freeze_playbook": freeze_playbook, "evaluation_end": evaluation_end},
+            )
+            self.storage.add_log(
+                session_id,
+                "RESEARCH_STAGE_PROGRESS",
+                "Loading bounded historical M5 candles for research.",
+                details={"stage": "historical_loading"},
+            )
+            dataset = self._historical_dataset(session, [], evaluation_end)
+            if not dataset.valid:
+                reason = str(dataset.metadata.get("reason") or "Historical dataset is invalid")
+                self.storage.add_log(
+                    session_id,
+                    "RESEARCH_FAILED",
+                    f"Background research job failed: {reason}",
+                    level="ERROR",
+                    details={"reason": reason, "historical_data": dataset.metadata, "freeze_playbook": freeze_playbook},
+                )
+                return
+            research_start = int(dataset.m5_bars[0]["time"])
+            self.storage.add_log(
+                session_id,
+                "RESEARCH_STAGE_PROGRESS",
+                "Evaluating candidates and walk-forward test windows.",
+                details={"stage": "candidate_evaluation", "m5_bars": len(dataset.m5_bars)},
+            )
+            if freeze_playbook:
+                rankings, snapshot = build_playbook_snapshot(
+                    dataset.m5_bars,
+                    research_start,
+                    int(session["research_ends_at"]),
+                    dataset.m1_window_provider or dataset.m1_bars,
+                    dataset.metadata,
+                )
+                self.storage.save_candidate_scores(session_id, rankings)
+                self.storage.add_log(
+                    session_id,
+                    "RESEARCH_STAGE_PROGRESS",
+                    "Freezing ranked playbook for autonomous trading.",
+                    details={"stage": "playbook_generation", "ranking_count": len(rankings)},
+                )
+                self.storage.set_selected_strategy(session_id, "adaptive_research_playbook", snapshot)
+                top_labels = [item["label"] for item in rankings[:3]]
+                self.storage.add_log(
+                    session_id,
+                    "PLAYBOOK_FROZEN",
+                    "Research finished. A ranked multi-strategy playbook was frozen instead of relying on one rare trigger.",
+                    details={
+                        "regime": snapshot.get("regime"),
+                        "top_modules": top_labels,
+                        "playbook": snapshot.get("playbook"),
+                        "accepted_strategy_count": snapshot.get("accepted_strategy_count"),
+                        "minimum_confidence": snapshot.get("minimum_confidence"),
+                        "historical_data": dataset.metadata,
+                    },
+                )
+            else:
+                scores, _rows, regime = evaluate_candidates(
+                    dataset.m5_bars, research_start, evaluation_end, dataset.m1_window_provider or dataset.m1_bars, dataset.metadata
+                )
+                self.storage.save_candidate_scores(session_id, scores)
+                leader = scores[0] if scores else None
+                if leader:
+                    self.storage.add_log(
+                        session_id,
+                        "RESEARCH_UPDATE",
+                        f"Research updated. Regime: {regime['name']}. Current playbook leader: {leader['label']}.",
+                        details={
+                            "leader": leader["name"],
+                            "score": leader["score"],
+                            "research_trades": leader["trades"],
+                            "net_r": leader["net_r"],
+                            "regime": regime,
+                            "historical_data": dataset.metadata,
+                        },
+                    )
+            self.storage.add_log(
+                session_id,
+                "RESEARCH_COMPLETED",
+                "Background research job completed.",
+                details={"freeze_playbook": freeze_playbook, "evaluation_end": evaluation_end},
+            )
+        except Exception as exc:
+            self.storage.add_log(
+                session_id,
+                "RESEARCH_FAILED",
+                f"Background research job failed: {exc}",
+                level="ERROR",
+                details={"error": str(exc), "freeze_playbook": freeze_playbook},
+            )
+        finally:
+            self._finish_research_job(session_id)
 
     def acknowledge_signal(self, session_id: str, signal_id: str, accepted: bool, message: str = "") -> None:
         status = "ACCEPTED" if accepted else "REJECTED"

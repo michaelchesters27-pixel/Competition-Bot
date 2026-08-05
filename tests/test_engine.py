@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -77,7 +78,7 @@ def test_new_attachment_launch_id_creates_fresh_session():
         assert phase_state(session).phase == "RESEARCH"
 
 
-def test_research_pulse_stores_actual_window_ranking():
+def test_research_pulse_stores_actual_window_ranking_in_background():
     with tempfile.TemporaryDirectory() as tmp:
         storage = Storage(str(Path(tmp) / "test.db"))
         started_bars = synthetic_bars()
@@ -96,9 +97,113 @@ def test_research_pulse_stores_actual_window_ranking():
         )
         assert result["phase"] == "RESEARCH"
         assert result["action"] == "HOLD"
-        scores = storage.latest_candidate_scores(started["session_id"])
+
+        deadline = time.time() + 5
+        scores = []
+        events = set()
+        while time.time() < deadline:
+            scores = storage.latest_candidate_scores(started["session_id"])
+            events = {log["event"] for log in storage.session_logs(started["session_id"], limit=20)}
+            if scores and "RESEARCH_COMPLETED" in events:
+                break
+            time.sleep(0.05)
+
         assert len(scores) >= 25
         assert all("oos_profit_factor" in score for score in scores)
+        assert "RESEARCH_JOB_STARTED" in events
+        assert "RESEARCH_STAGE_PROGRESS" in events
+        assert "RESEARCH_COMPLETED" in events
+
+
+def test_pulse_returns_promptly_while_research_runs_in_background():
+    class SlowHistoricalSource:
+        def __init__(self, bars):
+            self.bars = bars
+            self.started = threading.Event()
+            self.release = threading.Event()
+            self.calls = 0
+
+        def get_research_dataset(self, symbol, end_ts):
+            self.calls += 1
+            self.started.set()
+            assert self.release.wait(timeout=5)
+            return HistoricalDataset(
+                m5_bars=[bar for bar in self.bars if int(bar["time"]) < int(end_ts)],
+                m1_bars=[],
+                metadata={"valid": True, "source": "TEST"},
+            )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        storage = Storage(str(Path(tmp) / "test.db"))
+        started_bars = synthetic_bars()
+        source = SlowHistoricalSource(started_bars)
+        engine = CompetitionEngine(storage, source)
+        started = engine.start_or_resume("12345", "XAUUSD", "M5", "launch-a")
+        session = storage.get_session(started["session_id"])
+        assert session is not None
+        bars = synthetic_bars(start=int(session["started_at"]) - 408 * 300)
+
+        begin = time.monotonic()
+        result = engine.process_pulse(
+            {
+                "session_id": started["session_id"],
+                "bid": bars[-1]["close"] - 0.05,
+                "ask": bars[-1]["close"] + 0.05,
+                "bars": bars,
+            }
+        )
+        elapsed = time.monotonic() - begin
+
+        assert elapsed < 2
+        assert result["phase"] == "RESEARCH"
+        assert result["action"] == "HOLD"
+        assert source.started.wait(timeout=2)
+        assert source.calls == 1
+
+        second = engine.process_pulse(
+            {
+                "session_id": started["session_id"],
+                "bid": bars[-1]["close"] - 0.05,
+                "ask": bars[-1]["close"] + 0.05,
+                "bars": bars,
+            }
+        )
+        assert second["action"] == "HOLD"
+        assert source.calls == 1
+
+        source.release.set()
+        deadline = time.time() + 5
+        while time.time() < deadline and not storage.latest_candidate_scores(started["session_id"]):
+            time.sleep(0.05)
+
+        assert storage.latest_candidate_scores(started["session_id"])
+
+
+def test_background_research_failures_are_logged():
+    class BrokenHistoricalSource:
+        def get_research_dataset(self, symbol, end_ts):
+            raise RuntimeError("database unavailable")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        storage = Storage(str(Path(tmp) / "test.db"))
+        engine = CompetitionEngine(storage, BrokenHistoricalSource())
+        started = engine.start_or_resume("12345", "XAUUSD", "M5", "launch-a")
+        session = storage.get_session(started["session_id"])
+        assert session is not None
+        bars = synthetic_bars(start=int(session["started_at"]) - 408 * 300)
+
+        result = engine.process_pulse({"session_id": started["session_id"], "bid": 1, "ask": 2, "bars": bars})
+
+        assert result["action"] == "HOLD"
+        deadline = time.time() + 5
+        events = set()
+        while time.time() < deadline:
+            events = {log["event"] for log in storage.session_logs(started["session_id"], limit=20)}
+            if "HISTORICAL_DATA_UNAVAILABLE" in events and "RESEARCH_FAILED" in events:
+                break
+            time.sleep(0.05)
+        assert "HISTORICAL_DATA_UNAVAILABLE" in events
+        assert "RESEARCH_FAILED" in events
 
 
 def test_playbook_freezes_and_live_model_can_issue_signal():
