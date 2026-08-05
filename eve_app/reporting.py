@@ -188,6 +188,28 @@ def _research_dashboard(candidates: list[dict[str, Any]]) -> list[dict[str, Any]
         })
     return rows
 
+
+def _historical_data_from_logs(logs: list[dict[str, Any]]) -> dict[str, Any]:
+    for log in logs:
+        details = log.get("details") or {}
+        historical_data = details.get("historical_data")
+        if isinstance(historical_data, dict):
+            return historical_data
+        if log.get("event") == "HISTORICAL_DATA_UNAVAILABLE" and isinstance(details, dict):
+            return details
+    return {}
+
+
+def _historical_data_from_snapshot(strategy_snapshot: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(strategy_snapshot, dict):
+        return {}
+    regime = strategy_snapshot.get("regime") or {}
+    if not isinstance(regime, dict):
+        return {}
+    historical_data = regime.get("historical_data")
+    return historical_data if isinstance(historical_data, dict) else {}
+
+
 def build_dashboard(storage: Storage, session_id: str | None = None) -> dict[str, Any]:
     session = storage.get_session(session_id) if session_id else storage.latest_session()
     if not session:
@@ -210,6 +232,8 @@ def build_dashboard(storage: Storage, session_id: str | None = None) -> dict[str
     result_rs = [r["result_r"] for r in closed if r["result_r"] is not None]
 
     strategy_snapshot = json.loads(session["strategy_snapshot_json"]) if session.get("strategy_snapshot_json") else None
+    logs = storage.session_logs(session["id"], limit=80)
+    historical_data = _historical_data_from_snapshot(strategy_snapshot) or _historical_data_from_logs(logs)
     return {
         "has_session": True,
         "session": {
@@ -229,6 +253,7 @@ def build_dashboard(storage: Storage, session_id: str | None = None) -> dict[str
         "candidate_scores": candidates,
         "research_dashboard": _research_dashboard(candidates),
         "strategy_snapshot": strategy_snapshot,
+        "historical_data": historical_data,
         "trade_reports": reports,
         "stats": {
             "trades": len(reports),
@@ -241,5 +266,5 @@ def build_dashboard(storage: Storage, session_id: str | None = None) -> dict[str
             "net_profit": round(net_profit, 2),
             "average_r": round(sum(result_rs) / len(result_rs), 3) if result_rs else 0.0,
         },
-        "logs": storage.session_logs(session["id"], limit=80),
+        "logs": logs,
     }

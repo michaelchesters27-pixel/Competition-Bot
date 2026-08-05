@@ -75,3 +75,44 @@ def test_trade_ledger_builds_full_report_from_open_and_close_deals():
         assert report["net_profit"] == 3.9
         assert report["result_r"] == 2.0
         assert report["indicator_snapshot"]["evidence_scores"]["buy"] == 6.2
+
+
+def test_dashboard_exposes_historical_data_from_strategy_snapshot():
+    with tempfile.TemporaryDirectory() as tmp:
+        storage = Storage(str(Path(tmp) / "test.db"))
+        session = storage.get_or_create_session("123", "XAUUSD", "M5", "launch-a")
+        metadata = {
+            "valid": True,
+            "requested_symbol": "XAUUSD",
+            "query_symbol": "XAU/USD",
+            "m5_interval": "5min",
+            "earliest_m5": 1700000000,
+        }
+        storage.set_selected_strategy(
+            session["id"],
+            "adaptive_research_playbook",
+            {"regime": {"historical_data": metadata}, "playbook": []},
+        )
+
+        data = build_dashboard(storage, session["id"])
+
+        assert data["historical_data"] == metadata
+
+
+def test_dashboard_exposes_historical_data_from_engine_activity_logs():
+    with tempfile.TemporaryDirectory() as tmp:
+        storage = Storage(str(Path(tmp) / "test.db"))
+        session = storage.get_or_create_session("123", "XAUUSD", "M5", "launch-a")
+        metadata = {"valid": False, "reason": "No completed historical candles", "query_symbol": "XAU/USD"}
+        storage.add_log(
+            session["id"],
+            "HISTORICAL_DATA_UNAVAILABLE",
+            "Historical dataset rejected",
+            level="WARNING",
+            details=metadata,
+        )
+
+        data = build_dashboard(storage, session["id"])
+
+        assert data["historical_data"] == metadata
+        assert data["logs"][0]["details"] == metadata

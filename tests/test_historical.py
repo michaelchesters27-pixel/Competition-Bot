@@ -13,6 +13,7 @@ def _source(config: HistoricalConfig) -> SupabaseMarketCandles:
     source = object.__new__(SupabaseMarketCandles)
     source.config = config
     source._table = SupabaseMarketCandles._safe_table(config.table)
+    source._database_identity = {"host": "example", "database": "db"}
     return source
 
 
@@ -111,6 +112,67 @@ def test_historical_transactions_do_not_pass_read_only_keyword():
     assert transaction_kwargs == [{}, {}]
 
 
+def test_historical_database_identity_logging_is_safe(caplog, monkeypatch):
+    config = HistoricalConfig(database_url="postgresql://reader:secret@example.com:5432/market_db?sslmode=require")
+
+    class FakePsycopg:
+        def connect(self, *args, **kwargs):
+            raise AssertionError("connect should not be called during initialization")
+
+    class FakeRows:
+        dict_row = object()
+
+    def fake_import_module(name):
+        if name == "psycopg":
+            return FakePsycopg()
+        if name == "psycopg.rows":
+            return FakeRows()
+        raise AssertionError(name)
+
+    monkeypatch.setattr("eve_app.historical.importlib.import_module", fake_import_module)
+
+    with caplog.at_level("INFO", logger="eve_app.historical"):
+        SupabaseMarketCandles(config)
+
+    record = next(record for record in caplog.records if record.message == "historical database configured")
+    assert record.historical_db_host == "example.com"
+    assert record.historical_db_name == "market_db"
+    assert "secret" not in caplog.text
+
+
+def test_earliest_time_logs_attempt_parameters_and_result(caplog):
+    config = HistoricalConfig(database_url="postgresql://reader@example/db")
+    source = _source(config)
+
+    class Tx:
+        def __enter__(self): return None
+        def __exit__(self, *args): return False
+
+    class Rows:
+        def fetchone(self): return {"earliest_time": datetime(2024, 1, 1, tzinfo=timezone.utc)}
+
+    class Conn:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def transaction(self): return Tx()
+        def execute(self, sql, params=None): return Rows()
+
+    source._connect = lambda: Conn()
+
+    with caplog.at_level("INFO", logger="eve_app.historical"):
+        earliest = source.earliest_time("XAU/USD", "5min")
+
+    assert earliest == 1_704_067_200
+    attempt = next(record for record in caplog.records if record.message.startswith("historical earliest_time attempt"))
+    result = next(record for record in caplog.records if record.message.startswith("historical earliest_time result"))
+    assert "params={'symbol': 'XAU/USD', 'timeframe': '5min'}" in attempt.message
+    assert attempt.historical_symbol == "XAU/USD"
+    assert attempt.historical_interval == "5min"
+    assert attempt.historical_sql_params == {"symbol": "XAU/USD", "timeframe": "5min"}
+    assert result.historical_earliest_time == 1_704_067_200
+    assert result.historical_sql_params == {"symbol": "XAU/USD", "timeframe": "5min"}
+
+
 def test_completed_candles_only_are_loaded():
     config = HistoricalConfig(database_url="postgresql://reader@example/db")
     assert '"is_complete" = true' in _source(config)._select_sql()
@@ -157,6 +219,8 @@ def test_symbol_value_override_is_used_for_historical_queries():
     assert fetch_calls == [("XAU/USD", "5min", 1_700_000_000, 1_700_000_300), ("XAU/USD", "1min", 1_700_000_000, 1_700_000_300)]
     assert dataset.metadata["requested_symbol"] == "XAUUSD"
     assert dataset.metadata["query_symbol"] == "XAU/USD"
+    assert dataset.metadata["database_host"] == "example"
+    assert dataset.metadata["database_name"] == "db"
     assert dataset.metadata["m5_interval"] == "5min"
     assert dataset.metadata["m1_interval"] == "1min"
     assert dataset.metadata["earliest_m5"] == 1_700_000_000
@@ -208,6 +272,8 @@ def test_invalid_historical_dataset_reports_query_diagnostics():
     assert not dataset.valid
     assert dataset.metadata["valid"] is False
     assert dataset.metadata["query_symbol"] == "XAU/USD"
+    assert dataset.metadata["database_host"] == "example"
+    assert dataset.metadata["database_name"] == "db"
     assert dataset.metadata["requested_symbol"] == "XAUUSD"
     assert dataset.metadata["earliest_m5"] is None
     assert dataset.metadata["earliest_m1"] is None
