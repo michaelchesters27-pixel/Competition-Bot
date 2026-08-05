@@ -65,8 +65,8 @@ class HistoricalConfig:
     complete_column: str = "is_complete"
     preferred_source: str = "twelve_data"
     filter_preferred_source: bool = True
-    m1_value: str = "M1"
-    m5_value: str = "M5"
+    m1_value: str = "1min"
+    m5_value: str = "5min"
     lookback_days: int | None = None
     chunk_days: int = 30
     timeout_seconds: int = 20
@@ -97,8 +97,8 @@ class HistoricalConfig:
             complete_column=_env("EVE_MARKET_CANDLES_COMPLETE_COLUMN", "is_complete"),
             preferred_source=_env("EVE_MARKET_CANDLES_SOURCE_VALUE", "twelve_data"),
             filter_preferred_source=_env("EVE_MARKET_CANDLES_FILTER_SOURCE", "true").lower() not in {"0", "false", "no", "off"},
-            m1_value=_env("EVE_MARKET_CANDLES_M1_VALUE", "M1"),
-            m5_value=_env("EVE_MARKET_CANDLES_M5_VALUE", "M5"),
+            m1_value=_env("EVE_MARKET_CANDLES_M1_VALUE", "1min"),
+            m5_value=_env("EVE_MARKET_CANDLES_M5_VALUE", "5min"),
             lookback_days=lookback_days,
             chunk_days=max(1, int(_env("EVE_HISTORICAL_CHUNK_DAYS", "30"))),
             timeout_seconds=int(_env("EVE_HISTORICAL_QUERY_TIMEOUT_SECONDS", "20")),

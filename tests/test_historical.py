@@ -28,6 +28,42 @@ def test_actual_market_candles_column_defaults_are_used():
     assert '"timeframe"' not in sql
 
 
+def test_default_interval_values_match_market_candles_schema():
+    config = HistoricalConfig(database_url="postgresql://reader@example/db")
+    assert config.m1_value == "1min"
+    assert config.m5_value == "5min"
+
+
+def test_earliest_time_uses_supabase_interval_literal_by_default():
+    config = HistoricalConfig(database_url="postgresql://reader@example/db")
+    source = _source(config)
+    captured = {}
+
+    class Tx:
+        def __enter__(self): return None
+        def __exit__(self, *args): return False
+
+    class Rows:
+        def fetchone(self): return {"earliest_time": datetime(2024, 1, 1, tzinfo=timezone.utc)}
+
+    class Conn:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def transaction(self): return Tx()
+        def execute(self, sql, params=None):
+            if params and "timeframe" in params:
+                captured["sql"] = sql
+                captured["params"] = params
+            return Rows()
+
+    source._connect = lambda: Conn()
+
+    assert source.earliest_time("XAU/USD", source.config.m5_value) == 1_704_067_200
+    assert '"interval" = %(timeframe)s' in captured["sql"]
+    assert captured["params"] == {"symbol": "XAU/USD", "timeframe": "5min"}
+    assert isinstance(captured["params"]["timeframe"], str)
+
+
 def test_missing_spread_does_not_break_query_and_marks_assumed():
     config = HistoricalConfig(database_url="postgresql://reader@example/db", spread_column="")
     source = _source(config)
