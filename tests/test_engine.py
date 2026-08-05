@@ -40,7 +40,11 @@ def test_candidate_evaluation_returns_ranked_playbook():
     end = bars[-1]["time"] + 300
     start = end - 3600
     results, rows, regime = evaluate_candidates(bars, start, end)
-    assert len(results) == 6
+    assert len(results) >= 25
+    assert regime["candidate_families_tested"] >= 25
+    assert "indicator_correlation" in regime
+    assert all("oos_expectancy" in result for result in results)
+    assert all("correlation_status" in result for result in results)
     assert len(rows) == 420
     assert results == sorted(results, key=lambda result: result["score"], reverse=True)
     assert regime["name"] in {"TREND_UP", "TREND_DOWN", "EXPANSION", "COMPRESSION", "RANGE_MIXED"}
@@ -78,7 +82,9 @@ def test_research_pulse_stores_actual_window_ranking():
         )
         assert result["phase"] == "RESEARCH"
         assert result["action"] == "HOLD"
-        assert len(storage.latest_candidate_scores(started["session_id"])) == 6
+        scores = storage.latest_candidate_scores(started["session_id"])
+        assert len(scores) >= 25
+        assert all("oos_profit_factor" in score for score in scores)
 
 
 def test_playbook_freezes_and_live_model_can_issue_signal():
