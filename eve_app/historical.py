@@ -167,7 +167,7 @@ class SupabaseMarketCandles:
         with self._connect() as conn:
             conn.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
             conn.execute("SET statement_timeout = %s", (self.config.timeout_seconds * 1000,))
-            with conn.transaction(read_only=True):
+            with conn.transaction():
                 rows = conn.execute(self._select_sql(use_source_filter), params).fetchall()
         return normalize_bars(rows)
 
@@ -182,7 +182,7 @@ class SupabaseMarketCandles:
         """
         with self._connect() as conn:
             conn.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
-            with conn.transaction(read_only=True):
+            with conn.transaction():
                 row = conn.execute(sql, {"symbol": symbol, "timeframe": timeframe}).fetchone()
         return _ts(row["earliest_time"]) if row and row.get("earliest_time") else None
 
