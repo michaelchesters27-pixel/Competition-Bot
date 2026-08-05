@@ -5,6 +5,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterable
+from urllib.parse import urlparse
 
 Bar = dict[str, Any]
 
@@ -158,6 +159,13 @@ class SupabaseMarketCandles:
     def _connect(self):
         return self._psycopg.connect(self.config.database_url, row_factory=self._dict_row)
 
+    def connection_diagnostics(self) -> dict[str, str]:
+        parsed = urlparse(self.config.database_url)
+        return {
+            "database_host": parsed.hostname or "",
+            "database_name": parsed.path.lstrip("/"),
+        }
+
     def _fetch(self, symbol: str, timeframe: str, start_ts: int, end_ts: int, use_source_filter: bool = True) -> list[Bar]:
         params = {
             "symbol": symbol,
@@ -201,11 +209,61 @@ class SupabaseMarketCandles:
             cursor = chunk_end
         return normalize_bars(out)
 
+    @staticmethod
+    def _symbol_candidates(symbol: str) -> list[str]:
+        stripped = symbol.strip()
+        candidates = [stripped]
+        compact = stripped.replace("/", "")
+        if compact.upper() == "XAUUSD":
+            variant = "XAU/USD" if "/" not in stripped else "XAUUSD"
+            candidates.append(variant)
+        return list(dict.fromkeys(candidate for candidate in candidates if candidate))
+
+    def _earliest_params(self, symbol: str, timeframe: str) -> dict[str, str]:
+        return {"symbol": symbol, "timeframe": timeframe}
+
+    def _earliest_for_symbol(self, symbol: str) -> tuple[int | None, int | None, list[dict[str, Any]]]:
+        queries = []
+        earliest_m5 = self.earliest_time(symbol, self.config.m5_value)
+        queries.append(
+            {
+                "symbol": symbol,
+                "interval": self.config.m5_value,
+                "params": self._earliest_params(symbol, self.config.m5_value),
+                "earliest_time": earliest_m5,
+            }
+        )
+        earliest_m1 = self.earliest_time(symbol, self.config.m1_value)
+        queries.append(
+            {
+                "symbol": symbol,
+                "interval": self.config.m1_value,
+                "params": self._earliest_params(symbol, self.config.m1_value),
+                "earliest_time": earliest_m1,
+            }
+        )
+        return earliest_m5, earliest_m1, queries
+
     def get_research_dataset(self, symbol: str, end_ts: int) -> HistoricalDataset:
-        query_symbol = self.config.symbol_value or symbol
-        earliest_m5 = self.earliest_time(query_symbol, self.config.m5_value)
-        earliest_m1 = self.earliest_time(query_symbol, self.config.m1_value)
-        earliest = min([t for t in (earliest_m5, earliest_m1) if t is not None], default=None)
+        symbol_candidates = [self.config.symbol_value] if self.config.symbol_value else self._symbol_candidates(symbol)
+        diagnostics = self.connection_diagnostics()
+        diagnostics["source_table"] = self.config.table
+        diagnostics["complete_column"] = self.config.complete_column
+        diagnostics["earliest_queries"] = []
+        query_symbol = symbol_candidates[0]
+        earliest_m5: int | None = None
+        earliest_m1: int | None = None
+        earliest: int | None = None
+        for candidate in symbol_candidates:
+            candidate_m5, candidate_m1, candidate_queries = self._earliest_for_symbol(candidate)
+            diagnostics["earliest_queries"].extend(candidate_queries)
+            candidate_earliest = min([t for t in (candidate_m5, candidate_m1) if t is not None], default=None)
+            query_symbol = candidate
+            earliest_m5 = candidate_m5
+            earliest_m1 = candidate_m1
+            earliest = candidate_earliest
+            if candidate_earliest is not None:
+                break
         if earliest is None:
             reason = (
                 f"No completed historical candles found for symbol={query_symbol!r}, "
@@ -218,6 +276,7 @@ class SupabaseMarketCandles:
                     "valid": False,
                     "reason": reason,
                     "source_table": self.config.table,
+                    **diagnostics,
                     "requested_symbol": symbol,
                     "query_symbol": query_symbol,
                     "m5_interval": self.config.m5_value,
@@ -246,6 +305,7 @@ class SupabaseMarketCandles:
                 "valid": valid,
                 "reason": reason,
                 "source_table": self.config.table,
+                **diagnostics,
                 "requested_symbol": symbol,
                 "query_symbol": query_symbol,
                 "m5_interval": self.config.m5_value,
