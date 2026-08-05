@@ -112,6 +112,34 @@ def test_candle_time_timestamp_filtering_uses_timestamp_parameters():
     assert isinstance(captured["end_time"], datetime)
 
 
+def test_fetch_sets_statement_timeout_without_bound_parameter():
+    config = HistoricalConfig(database_url="postgresql://reader@example/db", timeout_seconds=20)
+    source = _source(config)
+    calls = []
+
+    class Tx:
+        def __enter__(self): return None
+        def __exit__(self, *args): return False
+
+    class Rows:
+        def fetchall(self): return []
+
+    class Conn:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def transaction(self): return Tx()
+        def execute(self, sql, params=None):
+            calls.append((sql, params))
+            return Rows()
+
+    source._connect = lambda: Conn()
+
+    source._fetch("XAUUSD", "M5", 1_700_000_000, 1_700_086_400)
+
+    assert ("SET statement_timeout = 20000", None) in calls
+    assert not any(sql == "SET statement_timeout = %s" for sql, _params in calls)
+
+
 def test_historical_transactions_do_not_pass_read_only_keyword():
     config = HistoricalConfig(database_url="postgresql://reader@example/db")
     source = _source(config)
