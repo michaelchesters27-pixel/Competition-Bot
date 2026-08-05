@@ -1,12 +1,22 @@
 from __future__ import annotations
 
 import importlib
+import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterable
+from urllib.parse import urlparse
 
 Bar = dict[str, Any]
+
+logger = logging.getLogger(__name__)
+
+
+def _safe_database_identity(database_url: str) -> dict[str, str]:
+    parsed = urlparse(database_url)
+    database = parsed.path.lstrip("/") or ""
+    return {"host": parsed.hostname or "", "database": database}
 
 
 def _env(name: str, default: str) -> str:
@@ -114,6 +124,15 @@ class SupabaseMarketCandles:
         self._dict_row = rows_module.dict_row
         self.config = config
         self._table = self._safe_table(config.table)
+        db_identity = _safe_database_identity(config.database_url)
+        logger.info(
+            "historical database configured",
+            extra={
+                "historical_db_host": db_identity["host"],
+                "historical_db_name": db_identity["database"],
+                "historical_source_table": config.table,
+            },
+        )
 
     @staticmethod
     def _safe_identifier(value: str) -> str:
@@ -182,11 +201,30 @@ class SupabaseMarketCandles:
               AND {self._safe_identifier(c.timeframe_column)} = %(timeframe)s
               AND {self._safe_identifier(c.complete_column)} = true
         """
+        params = {"symbol": symbol, "timeframe": timeframe}
+        logger.info(
+            "historical earliest_time attempt",
+            extra={
+                "historical_symbol": symbol,
+                "historical_interval": timeframe,
+                "historical_sql_params": params,
+            },
+        )
         with self._connect() as conn:
             conn.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
             with conn.transaction():
-                row = conn.execute(sql, {"symbol": symbol, "timeframe": timeframe}).fetchone()
-        return _ts(row["earliest_time"]) if row and row.get("earliest_time") else None
+                row = conn.execute(sql, params).fetchone()
+        earliest = _ts(row["earliest_time"]) if row and row.get("earliest_time") else None
+        logger.info(
+            "historical earliest_time result",
+            extra={
+                "historical_symbol": symbol,
+                "historical_interval": timeframe,
+                "historical_sql_params": params,
+                "historical_earliest_time": earliest,
+            },
+        )
+        return earliest
 
     def _fetch_chunked(self, symbol: str, timeframe: str, start_ts: int, end_ts: int) -> list[Bar]:
         out: list[Bar] = []

@@ -159,7 +159,12 @@ def research_dashboard():
     data = build_dashboard(storage, session_id)
     if not data.get("has_session"):
         return jsonify(data), 404
-    return jsonify({"session": data["session"], "research_dashboard": data["research_dashboard"], "strategy_snapshot": data.get("strategy_snapshot")})
+    return jsonify({
+        "session": data["session"],
+        "research_dashboard": data["research_dashboard"],
+        "strategy_snapshot": data.get("strategy_snapshot"),
+        "historical_data": data.get("historical_data", {}),
+    })
 
 
 if __name__ == "__main__":
