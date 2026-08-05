@@ -175,6 +175,7 @@ class CompetitionEngine:
                         "playbook": snapshot.get("playbook"),
                         "accepted_strategy_count": snapshot.get("accepted_strategy_count"),
                         "minimum_confidence": snapshot.get("minimum_confidence"),
+                        "historical_data": dataset.metadata,
                     },
                 )
                 session = self.storage.get_session(session_id) or session
