@@ -461,3 +461,36 @@ def test_failed_historical_connection_cannot_promote_strategy(tmp_path):
     assert storage.latest_candidate_scores(started["session_id"]) == []
     logs = storage.session_logs(started["session_id"], limit=10)
     assert any(log["event"] == "HISTORICAL_DATA_UNAVAILABLE" for log in logs)
+
+
+def test_historical_dataset_bounds_retained_m5_history():
+    config = HistoricalConfig(
+        database_url="postgresql://reader@example/db",
+        symbol_value="XAU/USD",
+        m5_value="5min",
+        m1_value="1min",
+        max_m5_bars=120,
+    )
+    source = _source(config)
+    source.earliest_time = lambda symbol, timeframe: 1_700_000_000 if timeframe == "5min" else None
+
+    def fake_iter_chunks(symbol, timeframe, start_ts, end_ts):
+        midpoint = start_ts + 300 * 100
+        yield [
+            {"time": start_ts + i * 300, "open": 1, "high": 2, "low": 0, "close": 1, "tick_volume": 1, "spread": 0}
+            for i in range(100)
+        ]
+        yield [
+            {"time": midpoint + i * 300, "open": 1, "high": 2, "low": 0, "close": 1, "tick_volume": 1, "spread": 0}
+            for i in range(100)
+        ]
+
+    source._iter_chunks = fake_iter_chunks
+
+    dataset = source.get_research_dataset("XAUUSD", 1_700_000_000 + 300 * 200)
+
+    assert dataset.valid
+    assert len(dataset.m5_bars) == 120
+    assert dataset.m5_bars[0]["time"] == 1_700_000_000 + 300 * 80
+    assert dataset.metadata["max_m5_bars"] == 120
+    assert dataset.metadata["m5_candles_processed"] == 200

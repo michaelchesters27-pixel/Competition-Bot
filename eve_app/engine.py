@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .historical import HistoricalConfig, HistoricalDataset, SupabaseMarketCandles
+from .memory import bounded_tail
 from .storage import Storage, utc_now_ts
 from .strategies import build_playbook_snapshot, evaluate_candidates, evaluate_live_playbook
 
@@ -109,7 +110,7 @@ class CompetitionEngine:
         if bars:
             self.storage.upsert_bars(session_id, bars)
 
-        stored_bars = self.storage.get_bars(session_id, limit=800)
+        stored_bars = bounded_tail(self.storage.get_bars(session_id, limit=800), 800)
         # MT5 sends the currently forming bar as the last row, so [-2] is the last closed M5 candle.
         closed_bar_time = int(stored_bars[-2]["time"]) if len(stored_bars) >= 2 else None
         phase = phase_state(session)

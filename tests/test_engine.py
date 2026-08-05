@@ -118,3 +118,14 @@ def test_playbook_freezes_and_live_model_can_issue_signal():
     )
     assert signal is None
     assert decision["decision"] == "HOLD"
+
+
+def test_research_regime_reports_bounded_memory_limits():
+    bars = synthetic_bars(count=620)
+    research_start = bars[0]["time"]
+    research_end = bars[-1]["time"] + 300
+
+    _rankings, _rows, regime = evaluate_candidates(bars, research_start, research_end)
+
+    assert regime["bounded_memory"]["feature_rows_limit"] == 5000
+    assert regime["bounded_memory"]["signal_vector_points"] <= 1200
