@@ -17,7 +17,7 @@ Autonomous XAUUSD M5 competition system hosted entirely on Railway, with an MT5 
 
 The first build froze one rare entry trigger. If that trigger never appeared, the entire trading hour could finish with zero trades.
 
-Version 2 freezes a **research-ranked playbook**, not one signal type. The first hour identifies the live XAUUSD regime and ranks six modules:
+Version 2 freezes a **research-ranked playbook**, not one signal type. The research engine now promotes only strategies with complete chronological TRAIN → VALIDATION → TEST walk-forward validation and at least 200 completed out-of-sample trades; otherwise it reports `INSUFFICIENT_EVIDENCE` honestly and does not promote the strategy. The first hour identifies the live XAUUSD regime and ranks six modules:
 
 1. Adaptive Directional Scalp
 2. T3 Pullback Resume
@@ -76,6 +76,38 @@ A new launch identifier is created when the EA is freshly attached, so the compl
 Keep the existing variable:
 
 - `EVE_API_KEY` — must exactly match the EA `ApiKey` input
+
+Add the read-only historical candle database variable:
+
+- `EVE_MARKET_CANDLES_DATABASE_URL` — PostgreSQL connection string for a Supabase role that can only `SELECT` from `public.market_candles`
+
+Optional historical configuration:
+
+- `EVE_MARKET_CANDLES_TABLE` — defaults to `public.market_candles`
+- `EVE_HISTORICAL_LOOKBACK_DAYS` — optional cap on history; unset means use all available candles
+- `EVE_HISTORICAL_QUERY_TIMEOUT_SECONDS` — defaults to `20`
+- `EVE_HISTORICAL_ENABLED` — defaults to `true`
+- `EVE_MARKET_CANDLES_*_COLUMN` and `EVE_MARKET_CANDLES_M1_VALUE`/`EVE_MARKET_CANDLES_M5_VALUE` — optional schema mapping overrides; defaults match `symbol`, `interval`, `candle_time`, `open`, `high`, `low`, `close`, `volume`, `source`, and `is_complete`
+- `EVE_HISTORICAL_CHUNK_DAYS` — defaults to `30` so full-history mode is loaded chronologically in date chunks
+- `EVE_MARKET_CANDLES_FILTER_SOURCE` — defaults to `true`; when enabled the loader prefers `source = 'twelve_data'` and falls back per chunk if no preferred-source rows exist
+
+Competition-Bot opens Supabase sessions as read-only transactions and only queries historical candles. Stored M5 candles are used for strategy research when available. Stored M1 candles are used only for stop-loss/take-profit path simulation; M5 is built from M1 only when stored M5 history is genuinely unavailable. Historical candles are not copied into Competition-Bot SQLite. If Supabase history is unavailable or schema validation/querying fails, Competition-Bot reports `HISTORICAL_DATA_UNAVAILABLE`, does not promote strategies from limited EA bars, and returns `HOLD` until valid historical research is available.
+
+### Supabase read-only role setup
+
+Run this in Supabase SQL Editor, replacing the password before storing the resulting connection string in Railway as `EVE_MARKET_CANDLES_DATABASE_URL`:
+
+```sql
+create role competition_bot_reader login password 'REPLACE_WITH_STRONG_PASSWORD';
+grant connect on database postgres to competition_bot_reader;
+grant usage on schema public to competition_bot_reader;
+grant select on table public.market_candles to competition_bot_reader;
+revoke insert, update, delete, truncate, references, trigger on table public.market_candles from competition_bot_reader;
+alter role competition_bot_reader set default_transaction_read_only = on;
+alter role competition_bot_reader set statement_timeout = '20s';
+```
+
+Do not use Supabase service-role credentials for Competition-Bot.
 
 Railway supplies `PORT` automatically.
 
