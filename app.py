@@ -153,6 +153,15 @@ def report(session_id: str):
     return jsonify(data)
 
 
+@app.get("/api/research")
+def research_dashboard():
+    session_id = request.args.get("session_id")
+    data = build_dashboard(storage, session_id)
+    if not data.get("has_session"):
+        return jsonify(data), 404
+    return jsonify({"session": data["session"], "research_dashboard": data["research_dashboard"], "strategy_snapshot": data.get("strategy_snapshot")})
+
+
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)

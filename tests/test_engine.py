@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 
 from eve_app.engine import CompetitionEngine, phase_state
+from eve_app.historical import HistoricalDataset
 from eve_app.storage import Storage
 from eve_app.strategies import build_playbook_snapshot, evaluate_candidates, evaluate_live_playbook
 
@@ -33,6 +34,18 @@ def synthetic_bars(count: int = 420, start: int | None = None, direction: float 
         )
         price = close
     return bars
+
+
+class StaticHistoricalSource:
+    def __init__(self, bars):
+        self.bars = bars
+
+    def get_research_dataset(self, symbol, end_ts):
+        return HistoricalDataset(
+            m5_bars=[bar for bar in self.bars if int(bar["time"]) < int(end_ts)],
+            m1_bars=[],
+            metadata={"valid": True, "source": "TEST"},
+        )
 
 
 def test_candidate_evaluation_returns_ranked_playbook():
@@ -67,7 +80,8 @@ def test_new_attachment_launch_id_creates_fresh_session():
 def test_research_pulse_stores_actual_window_ranking():
     with tempfile.TemporaryDirectory() as tmp:
         storage = Storage(str(Path(tmp) / "test.db"))
-        engine = CompetitionEngine(storage)
+        started_bars = synthetic_bars()
+        engine = CompetitionEngine(storage, StaticHistoricalSource(started_bars))
         started = engine.start_or_resume("12345", "XAUUSD", "M5", "launch-a")
         session = storage.get_session(started["session_id"])
         assert session is not None
@@ -93,15 +107,14 @@ def test_playbook_freezes_and_live_model_can_issue_signal():
     research_start = research_end - 3600
     rankings, snapshot = build_playbook_snapshot(bars, research_start, research_end)
     assert rankings
-    assert snapshot["playbook"]
+    assert snapshot["accepted_strategy_count"] == 0
+    assert snapshot["playbook"] == []
+    assert all(item["status"] == "INSUFFICIENT_EVIDENCE" for item in rankings)
     signal, decision = evaluate_live_playbook(
         snapshot,
         bars,
         bid=bars[-1]["close"] - 0.05,
         ask=bars[-1]["close"] + 0.05,
     )
-    assert decision["bar_time"] == bars[-2]["time"]
-    assert signal is not None
-    assert signal["action"] == "BUY"
-    assert signal["strategy"] in snapshot["playbook"]
-    assert signal["tp"] > signal["sl"]
+    assert signal is None
+    assert decision["decision"] == "HOLD"

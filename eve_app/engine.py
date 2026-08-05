@@ -4,6 +4,7 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+from .historical import HistoricalConfig, HistoricalDataset, SupabaseMarketCandles
 from .storage import Storage, utc_now_ts
 from .strategies import build_playbook_snapshot, evaluate_candidates, evaluate_live_playbook
 
@@ -29,8 +30,53 @@ def phase_state(session: dict[str, Any], now: int | None = None) -> PhaseState:
 
 
 class CompetitionEngine:
-    def __init__(self, storage: Storage) -> None:
+    def __init__(self, storage: Storage, historical_source: SupabaseMarketCandles | None = None) -> None:
         self.storage = storage
+        if historical_source is not None:
+            self.historical_source = historical_source
+        else:
+            config = HistoricalConfig.from_env()
+            self.historical_source = SupabaseMarketCandles(config) if config else None
+
+    def _historical_dataset(self, session: dict[str, Any], fallback_bars: list[dict[str, Any]], end_ts: int) -> HistoricalDataset:
+        if not self.historical_source:
+            self.storage.add_log(
+                session["id"],
+                "HISTORICAL_DATA_UNAVAILABLE",
+                "Supabase historical source is not configured; research promotion is disabled.",
+                level="WARNING",
+                details={"reason": "Supabase historical source is not configured"},
+            )
+            return HistoricalDataset(
+                m5_bars=[],
+                m1_bars=[],
+                metadata={"valid": False, "source": "NONE", "reason": "Supabase historical source is not configured"},
+            )
+        try:
+            dataset = self.historical_source.get_research_dataset(str(session["symbol"]), end_ts)
+            if dataset.valid:
+                return dataset
+            self.storage.add_log(
+                session["id"],
+                "HISTORICAL_DATA_UNAVAILABLE",
+                "Historical candle database did not return a valid research dataset; research promotion is disabled.",
+                level="WARNING",
+                details=dataset.metadata,
+            )
+            return dataset
+        except Exception as exc:
+            self.storage.add_log(
+                session["id"],
+                "HISTORICAL_DATA_UNAVAILABLE",
+                f"Historical candle database unavailable; research promotion is disabled: {exc}",
+                level="WARNING",
+                details={"valid": False, "error": str(exc)},
+            )
+            return HistoricalDataset(
+                m5_bars=[],
+                m1_bars=[],
+                metadata={"valid": False, "source": "NONE", "reason": str(exc)},
+            )
 
     def start_or_resume(
         self, account_login: str, symbol: str, timeframe: str, launch_id: str
@@ -70,8 +116,13 @@ class CompetitionEngine:
         if phase.phase == "RESEARCH":
             if closed_bar_time and closed_bar_time != session.get("last_bar_time") and len(stored_bars) >= 80:
                 evaluation_end = min(utc_now_ts(), int(session["research_ends_at"]))
+                dataset = self._historical_dataset(session, stored_bars, evaluation_end)
+                if not dataset.valid:
+                    self.storage.touch_session(session_id, closed_bar_time)
+                    return self._pulse_payload(session, phase_state(session), None)
+                research_start = int(dataset.m5_bars[0]["time"])
                 scores, _rows, regime = evaluate_candidates(
-                    stored_bars, int(session["started_at"]), evaluation_end
+                    dataset.m5_bars, research_start, evaluation_end, dataset.m1_bars, dataset.metadata
                 )
                 self.storage.save_candidate_scores(session_id, scores)
                 self.storage.touch_session(session_id, closed_bar_time)
@@ -87,6 +138,7 @@ class CompetitionEngine:
                             "research_trades": leader["trades"],
                             "net_r": leader["net_r"],
                             "regime": regime,
+                            "historical_data": dataset.metadata,
                         },
                     )
             else:
@@ -97,10 +149,17 @@ class CompetitionEngine:
 
         if phase.phase in ("TRADING", "COMPLETE") and not session.get("selected_strategy"):
             if len(stored_bars) >= 80:
+                dataset = self._historical_dataset(session, stored_bars, int(session["research_ends_at"]))
+                if not dataset.valid:
+                    self.storage.touch_session(session_id)
+                    return self._pulse_payload(session, phase_state(session), None)
+                research_start = int(dataset.m5_bars[0]["time"])
                 rankings, snapshot = build_playbook_snapshot(
-                    stored_bars,
-                    int(session["started_at"]),
+                    dataset.m5_bars,
+                    research_start,
                     int(session["research_ends_at"]),
+                    dataset.m1_bars,
+                    dataset.metadata,
                 )
                 self.storage.save_candidate_scores(session_id, rankings)
                 self.storage.set_selected_strategy(session_id, "adaptive_research_playbook", snapshot)
@@ -113,6 +172,7 @@ class CompetitionEngine:
                         "regime": snapshot.get("regime"),
                         "top_modules": top_labels,
                         "playbook": snapshot.get("playbook"),
+                        "accepted_strategy_count": snapshot.get("accepted_strategy_count"),
                         "minimum_confidence": snapshot.get("minimum_confidence"),
                     },
                 )
