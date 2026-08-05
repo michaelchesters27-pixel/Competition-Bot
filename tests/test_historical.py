@@ -166,6 +166,38 @@ def test_symbol_value_override_is_used_for_historical_queries():
     assert dataset.metadata["reason"] == "OK"
 
 
+def test_xauusd_falls_back_to_slash_symbol_for_historical_queries():
+    config = HistoricalConfig(database_url="postgresql://reader@example/db", m5_value="5min", m1_value="1min")
+    source = _source(config)
+    earliest_calls = []
+    fetch_calls = []
+
+    def fake_earliest(symbol, timeframe):
+        earliest_calls.append((symbol, timeframe))
+        if symbol == "XAU/USD" and timeframe == "5min":
+            return 1_700_000_000
+        return None
+
+    def fake_fetch_chunked(symbol, timeframe, start_ts, end_ts):
+        fetch_calls.append((symbol, timeframe, start_ts, end_ts))
+        if symbol == "XAU/USD" and timeframe == "5min":
+            return [{"time": start_ts, "open": 1, "high": 2, "low": 0, "close": 1, "tick_volume": 1, "spread": 0}]
+        return []
+
+    source.earliest_time = fake_earliest
+    source._fetch_chunked = fake_fetch_chunked
+
+    dataset = source.get_research_dataset("XAUUSD", 1_700_000_300)
+
+    assert dataset.valid
+    assert earliest_calls == [("XAUUSD", "5min"), ("XAUUSD", "1min"), ("XAU/USD", "5min"), ("XAU/USD", "1min")]
+    assert fetch_calls == [("XAU/USD", "5min", 1_700_000_000, 1_700_000_300), ("XAU/USD", "1min", 1_700_000_000, 1_700_000_300)]
+    assert dataset.metadata["requested_symbol"] == "XAUUSD"
+    assert dataset.metadata["query_symbol"] == "XAU/USD"
+    assert dataset.metadata["earliest_m5"] == 1_700_000_000
+    assert dataset.metadata["earliest_m1"] is None
+
+
 def test_invalid_historical_dataset_reports_query_diagnostics():
     config = HistoricalConfig(database_url="postgresql://reader@example/db", symbol_value="XAU/USD", m5_value="5min", m1_value="1min")
     source = _source(config)

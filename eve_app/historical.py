@@ -201,11 +201,36 @@ class SupabaseMarketCandles:
             cursor = chunk_end
         return normalize_bars(out)
 
+    @staticmethod
+    def _symbol_candidates(symbol: str) -> list[str]:
+        stripped = symbol.strip()
+        candidates = [stripped]
+        compact = stripped.replace("/", "")
+        if compact.upper() == "XAUUSD":
+            variant = "XAU/USD" if "/" not in stripped else "XAUUSD"
+            candidates.append(variant)
+        return list(dict.fromkeys(candidate for candidate in candidates if candidate))
+
+    def _earliest_for_symbol(self, symbol: str) -> tuple[int | None, int | None]:
+        earliest_m5 = self.earliest_time(symbol, self.config.m5_value)
+        earliest_m1 = self.earliest_time(symbol, self.config.m1_value)
+        return earliest_m5, earliest_m1
+
     def get_research_dataset(self, symbol: str, end_ts: int) -> HistoricalDataset:
-        query_symbol = self.config.symbol_value or symbol
-        earliest_m5 = self.earliest_time(query_symbol, self.config.m5_value)
-        earliest_m1 = self.earliest_time(query_symbol, self.config.m1_value)
-        earliest = min([t for t in (earliest_m5, earliest_m1) if t is not None], default=None)
+        symbol_candidates = [self.config.symbol_value] if self.config.symbol_value else self._symbol_candidates(symbol)
+        query_symbol = symbol_candidates[0]
+        earliest_m5: int | None = None
+        earliest_m1: int | None = None
+        earliest: int | None = None
+        for candidate in symbol_candidates:
+            candidate_m5, candidate_m1 = self._earliest_for_symbol(candidate)
+            candidate_earliest = min([t for t in (candidate_m5, candidate_m1) if t is not None], default=None)
+            query_symbol = candidate
+            earliest_m5 = candidate_m5
+            earliest_m1 = candidate_m1
+            earliest = candidate_earliest
+            if candidate_earliest is not None:
+                break
         if earliest is None:
             reason = (
                 f"No completed historical candles found for symbol={query_symbol!r}, "
