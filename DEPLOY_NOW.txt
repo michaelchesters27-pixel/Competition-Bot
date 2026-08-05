@@ -1,0 +1,12 @@
+EVE COMPETITION SCALPER v2.00 — RESTART STEPS
+
+1. DO NOT attach the new EA yet. Attachment starts the two-hour clock.
+2. Replace every file in the existing Competition-Bot GitHub repository with this package.
+3. Commit and push. Wait for Railway deployment SUCCESS.
+4. Open https://competition-bot-production-9b15.up.railway.app and confirm it loads.
+5. Put EVE_Competition_Scalper.mq5 into MT5 MQL5/Experts.
+6. Open it in MetaEditor and press F7. Confirm 0 errors.
+7. Confirm ApiKey matches the existing EVE_API_KEY Railway variable.
+8. Remove the old EA.
+9. When the competition is ready to restart, attach v2 to XAUUSD M5 and enable Algo Trading.
+10. The dashboard should immediately show a fresh session at RESEARCH 60:00.

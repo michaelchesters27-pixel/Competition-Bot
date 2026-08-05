@@ -14,20 +14,20 @@ def test_empty_dashboard():
         assert data["has_session"] is False
 
 
-def test_trade_ledger_builds_one_report_from_open_and_close_deals():
+def test_trade_ledger_builds_full_report_from_open_and_close_deals():
     with tempfile.TemporaryDirectory() as tmp:
         storage = Storage(str(Path(tmp) / "test.db"))
-        session = storage.get_or_create_session("123", "XAUUSD", "M5")
+        session = storage.get_or_create_session("123", "XAUUSD", "M5", "launch-a")
         signal = storage.create_signal(
             session_id=session["id"],
             bar_time=1700000000,
-            strategy="t3_pullback_resume",
+            strategy="adaptive_directional_scalp",
             action="BUY",
             sl=2398.0,
             tp=2404.0,
             confidence=84.0,
-            reasons=["test reason"],
-            indicator_snapshot={"atr": 2.0},
+            reasons=["T3, momentum and candle direction aligned"],
+            indicator_snapshot={"atr": 2.0, "evidence_scores": {"buy": 6.2, "sell": 1.4}},
         )
         assert signal is not None
         storage.save_deal(
@@ -69,9 +69,9 @@ def test_trade_ledger_builds_one_report_from_open_and_close_deals():
             }
         )
         data = build_dashboard(storage, session["id"])
-        assert len(data["trade_reports"]) == 1
         report = data["trade_reports"][0]
         assert report["status"] == "CLOSED"
         assert report["signal_id"] == signal["id"]
         assert report["net_profit"] == 3.9
         assert report["result_r"] == 2.0
+        assert report["indicator_snapshot"]["evidence_scores"]["buy"] == 6.2

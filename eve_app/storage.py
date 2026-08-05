@@ -50,6 +50,7 @@ class Storage:
                     account_login TEXT NOT NULL,
                     symbol TEXT NOT NULL,
                     timeframe TEXT NOT NULL,
+                    launch_id TEXT,
                     started_at INTEGER NOT NULL,
                     research_ends_at INTEGER NOT NULL,
                     trading_ends_at INTEGER NOT NULL,
@@ -63,7 +64,6 @@ class Storage:
                 );
                 CREATE INDEX IF NOT EXISTS idx_sessions_lookup
                     ON sessions(account_login, symbol, timeframe, started_at DESC);
-
                 CREATE TABLE IF NOT EXISTS bars (
                     session_id TEXT NOT NULL,
                     bar_time INTEGER NOT NULL,
@@ -149,34 +149,46 @@ class Storage:
                     ON engine_logs(session_id, created_at DESC);
                 """
             )
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()}
+            if "launch_id" not in columns:
+                conn.execute("ALTER TABLE sessions ADD COLUMN launch_id TEXT")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sessions_launch ON sessions(account_login,symbol,timeframe,launch_id)"
+            )
 
-    def get_or_create_session(self, account_login: str, symbol: str, timeframe: str) -> dict[str, Any]:
+    def get_or_create_session(
+        self, account_login: str, symbol: str, timeframe: str, launch_id: str
+    ) -> dict[str, Any]:
         now = utc_now_ts()
+        launch_id = str(launch_id or "").strip() or uuid.uuid4().hex
         with _LOCK, self.connection() as conn:
             row = conn.execute(
                 """
                 SELECT * FROM sessions
-                WHERE account_login=? AND symbol=? AND timeframe=? AND trading_ends_at>?
+                WHERE account_login=? AND symbol=? AND timeframe=? AND launch_id=?
                 ORDER BY started_at DESC LIMIT 1
                 """,
-                (account_login, symbol, timeframe, now),
+                (account_login, symbol, timeframe, launch_id),
             ).fetchone()
             if row:
                 conn.execute(
                     "UPDATE sessions SET last_seen_at=?, updated_at=? WHERE id=?",
                     (now, now, row["id"]),
                 )
-                return dict(row)
+                return dict(conn.execute("SELECT * FROM sessions WHERE id=?", (row["id"],)).fetchone())
 
             session_id = uuid.uuid4().hex[:16]
             conn.execute(
                 """
                 INSERT INTO sessions(
-                    id,account_login,symbol,timeframe,started_at,research_ends_at,trading_ends_at,
+                    id,account_login,symbol,timeframe,launch_id,started_at,research_ends_at,trading_ends_at,
                     last_seen_at,created_at,updated_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
                 """,
-                (session_id, account_login, symbol, timeframe, now, now + 3600, now + 7200, now, now, now),
+                (
+                    session_id, account_login, symbol, timeframe, launch_id, now, now + 3600, now + 7200,
+                    now, now, now,
+                ),
             )
             return dict(conn.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone())
 

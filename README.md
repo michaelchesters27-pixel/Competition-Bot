@@ -1,237 +1,119 @@
-# EVE Competition Scalper
+# EVE Competition Scalper v2.00
 
-A complete **Railway-hosted frontend and backend** plus an **MT5 Expert Advisor** for the autonomous XAUUSD M5 competition project.
+Autonomous XAUUSD M5 competition system hosted entirely on Railway, with an MT5 Expert Advisor as the execution bridge.
 
-## Locked operating rules
+## Locked competition format
 
-- Market: **XAUUSD** (broker suffixes such as `XAUUSD.a` are accepted)
-- Timeframe: **M5**
-- Lot size: **fixed 0.01 lots on every entry**
-- Session starts automatically when the EA first connects after being attached
-- Phase 1: **exactly 60 minutes of research; trading is blocked**
-- Phase 2: **exactly 60 minutes of autonomous trading**
+- XAUUSD only
+- M5 chart
+- Fixed 0.01 lots per order
+- The two-hour run begins when the v2 EA is attached and initialises
+- First 60 minutes: research only; MT5 trading is blocked
+- Second 60 minutes: autonomous execution
+- Railway serves the backend, database, API and browser dashboard
 - No Netlify
-- Railway serves the API and browser dashboard from one service
-- No invented session-loss cap, losing-trade cap, cooldown, martingale, grid, or forced end-of-session close
-- No attempt to observe or infer competitors' strategies, positions, P/L, or ranking
 
-The backend resumes an unfinished session if the EA is removed and reattached before the two-hour window ends. Once that window is complete, the next attachment starts a new session.
+## What changed in v2
 
-## What Phase 1 does
+The first build froze one rare entry trigger. If that trigger never appeared, the entire trading hour could finish with zero trades.
 
-The EA uploads recent XAUUSD M5 history and then keeps the Railway engine updated as each M5 candle closes. The engine calculates and evaluates:
+Version 2 freezes a **research-ranked playbook**, not one signal type. The first hour identifies the live XAUUSD regime and ranks six modules:
 
-- Tillson T3 fast and slow trend state
-- Squeeze Momentum compression and release
-- Momentum direction and acceleration
-- Chaikin Volatility and its change
-- Change of Volatility based on ATR
-- ATR
-- Candle body quality
-- Recent M5 structure breaks
-
-It chronologically backtests five candidate strategies against the supplied MT5 history and refreshes the ranking during the research hour:
-
-1. T3 Squeeze Release
+1. Adaptive Directional Scalp
 2. T3 Pullback Resume
-3. Volatility Structure Break
-4. T3 Momentum Continuation
-5. Squeeze Mean Reversion
+3. T3 Momentum Continuation
+4. Volatility Structure Break
+5. T3 Squeeze Release
+6. Squeeze Mean Reversion
 
-At the end of the exact first hour, the highest research score is selected and frozen.
+During the trading hour, every fully closed M5 candle is assessed by every module. The strongest qualifying setup is sent to MT5. The dashboard records both executed signals and M5 HOLD decisions.
 
-## What Phase 2 does
+Historical M5 bars are used to warm the T3, squeeze, Chaikin Volatility, Change of Volatility and ATR calculations. The research ranking itself is based on the actual first-hour competition window and the regime observed in it.
 
-The frozen strategy is evaluated once per newly closed M5 candle. When its full conditions are met, Railway sends a BUY or SELL instruction containing:
+## Deploy the Railway update
 
-- signal ID
-- direction
-- dynamic ATR-based stop-loss
-- dynamic strategy-specific take-profit
-- setup confidence
-- exact entry reasons
-- complete indicator snapshot
+This ZIP is a complete repository replacement, not a patch.
 
-The MT5 EA executes the instruction at **0.01 lots**, acknowledges the broker result, and reports every opening and closing deal back to Railway.
+1. Extract the ZIP.
+2. Replace the contents of the existing `Competition-Bot` GitHub repository with the contents of the extracted project folder.
+3. Commit and push all files.
+4. Wait for the existing Railway service to redeploy successfully.
+5. Open your existing Railway dashboard domain and confirm the page loads.
 
-The engine does not open trades during Phase 1 and does not issue new entries after Phase 2 finishes. It does not forcibly close a position that remains open after the competition window; the position continues toward its existing SL or TP and is still reported.
+The existing Railway domain remains:
 
-## Full reporting
+`https://competition-bot-production-9b15.up.railway.app`
 
-The Railway dashboard includes:
+The database migration is automatic. Existing reports remain stored, but each fresh EA attachment gets a new session and a new two-hour clock.
 
-- exact phase and countdown
-- MT5 connection status
-- live research ranking
-- frozen strategy
-- trade count
-- realised P/L
-- win rate
-- profit factor
-- average R
-- open positions
-- engine activity log
-- expandable report for every entry
+## Install the MT5 EA
 
-Each trade report includes the signal, reasons, indicator state, direction, volume, entry, exit, SL, TP, confidence, commission, swap, net P/L, R result, MFE, MAE, duration, and all linked MT5 deal activity.
-
-The reporting ledger handles hedging and netting accounts by allocating closing deals back to individual opening deals.
-
----
-
-# Deploy the Railway project
-
-## 1. Put the project into GitHub
-
-Create a new empty GitHub repository and upload the **contents of this folder** to the repository root.
-
-The repository root must contain:
-
-- `app.py`
-- `requirements.txt`
-- `railway.json`
-- `Procfile`
-- `eve_app/`
-- `templates/`
-- `mql5/`
-
-Do not upload the outer ZIP as a single file inside GitHub. Extract it first and upload the contents.
-
-## 2. Create the Railway service
-
-1. Open Railway.
-2. Choose **New Project**.
-3. Choose **Deploy from GitHub repo**.
-4. Select the repository.
-5. Wait for the first deployment.
-
-Railway will install the Python dependencies and use the start command in `railway.json`.
-
-## 3. Add the API key variable
-
-In the Railway service:
-
-1. Open **Variables**.
-2. Add:
-
-```text
-EVE_API_KEY=choose-a-private-key-here
-```
-
-Use a private value with letters and numbers. You must enter the exact same value in the MT5 EA inputs.
-
-## 4. Attach persistent storage
-
-The session clock, research scores, signals, deals, and reports use SQLite.
-
-1. Open the Railway service.
-2. Attach a **Volume**.
-3. Set its mount path to:
-
-```text
-/data
-```
-
-Railway provides the mount path to the application automatically. Without a volume, the app still runs, but the database can be lost when Railway replaces the deployment container.
-
-## 5. Generate the Railway domain
-
-1. Open the service **Settings**.
-2. Open **Networking**.
-3. Choose **Generate Domain**.
-4. Copy the complete HTTPS address.
-
-Example format:
-
-```text
-https://your-service-name.up.railway.app
-```
-
-Open that address in the browser. The Railway dashboard should load and show **Waiting for MT5**.
-
----
-
-# Install the MT5 EA
-
-The EA source file is:
-
-```text
-mql5/EVE_Competition_Scalper.mq5
-```
-
-## 1. Copy it into MetaEditor
+Do not attach it until the restarted competition is ready, because attachment starts the research clock.
 
 1. Open MT5.
-2. Press **F4** to open MetaEditor.
-3. In MetaEditor choose **File → Open Data Folder**.
-4. Open `MQL5`.
-5. Open `Experts`.
-6. Copy `EVE_Competition_Scalper.mq5` into that folder.
-7. Open the file in MetaEditor.
-8. Press **F7** to compile it.
+2. Press `F4` to open MetaEditor.
+3. Open the MT5 data folder and place `EVE_Competition_Scalper.mq5` in `MQL5/Experts`.
+4. Open the file in MetaEditor.
+5. Confirm the `RailwayBaseUrl` input contains the existing Railway domain.
+6. Confirm the `ApiKey` matches the `EVE_API_KEY` Railway variable already used by the working v1 connection.
+7. Press `F7` to compile.
+8. In MT5, open **Tools → Options → Expert Advisors**.
+9. Enable **Allow WebRequest for listed URL** and add:
 
-The compiled file will appear as `EVE_Competition_Scalper.ex5`.
+   `https://competition-bot-production-9b15.up.railway.app`
 
-## 2. Allow the Railway connection in MT5
+10. Remove the old EA from the chart.
+11. Open XAUUSD on M5.
+12. Attach `EVE_Competition_Scalper` only when the competition clock should begin.
+13. Enable Algo Trading.
 
-1. In MT5 choose **Tools → Options**.
-2. Open **Expert Advisors**.
-3. Tick **Allow WebRequest for listed URL**.
-4. Add your Railway base URL exactly, without `/api` at the end.
+## Fresh-session behaviour
 
-Example:
+A new launch identifier is created when the EA is freshly attached, so the completed v1 session will not be resumed. A terminal restart can resume the same attachment launch. Removing, recompiling or changing the EA inputs clears the launch identifier so the next attachment begins a fresh run.
 
-```text
-https://your-service-name.up.railway.app
-```
+## Railway variables
 
-5. Press **OK**.
+Keep the existing variable:
 
-## 3. Attach the EA
+- `EVE_API_KEY` — must exactly match the EA `ApiKey` input
 
-1. Open the broker's XAUUSD chart.
-2. Set the chart to **M5**.
-3. Drag `EVE_Competition_Scalper` onto the chart.
-4. In the EA inputs set:
+Railway supplies `PORT` automatically.
 
-```text
-RailwayBaseUrl = your complete Railway HTTPS domain
-ApiKey         = the exact EVE_API_KEY value used in Railway
-FixedLots      = 0.01
-```
+For persistent SQLite storage, keep the Railway volume mounted. The application uses `RAILWAY_VOLUME_MOUNT_PATH` automatically when it is available.
 
-5. Tick **Allow Algo Trading**.
-6. Press **OK**.
-7. Turn on the main **Algo Trading** button in MT5.
+## Trade reporting
 
-The two-hour session begins when the EA successfully connects. The chart comment and Railway dashboard show the session ID, current phase, countdown, and selected strategy.
+Every issued trade stores:
 
----
+- entry module
+- buy or sell direction
+- M5 signal candle
+- entry reasons
+- confidence
+- SL and TP
+- T3 values and slopes
+- squeeze state and momentum
+- Chaikin Volatility
+- Change of Volatility
+- ATR
+- body ratio and breakout state
+- research regime and module rank
+- every MT5 deal
+- commission and swap
+- net P/L
+- result in R
+- MFE and MAE where candle history is available
 
-# Important first-run checks
+## Verification performed
 
-Before treating it as a competition run, attach it to a demo account and confirm:
+The Python application passes six automated tests covering:
 
-1. The chart says `Phase: RESEARCH`.
-2. The Railway dashboard changes from **Waiting for MT5** to **MT5 connected**.
-3. Research rankings appear after the initial history upload.
-4. No order is opened during the first hour.
-5. The MT5 **Experts** tab has no WebRequest or authentication errors.
+- actual-window research ranking
+- fresh sessions for fresh EA attachments
+- session resumption for the same launch
+- research pulse storage
+- playbook freezing
+- live signal production on a qualifying M5 trend
+- complete entry/exit trade reporting
 
-If MT5 shows a WebRequest error, the usual cause is that the Railway URL was not added to **Tools → Options → Expert Advisors**.
-
-If Railway returns `UNAUTHORIZED`, the EA `ApiKey` does not exactly match Railway's `EVE_API_KEY` variable.
-
-If the EA refuses to initialise, verify that the chart is XAUUSD M5 and the broker supports an exact 0.01-lot order on that symbol.
-
-## Files
-
-- `mql5/EVE_Competition_Scalper.mq5` — MT5 execution and reporting bridge
-- `app.py` — Railway web application and API
-- `eve_app/engine.py` — exact session clock and phase controller
-- `eve_app/indicators.py` — T3, Squeeze Momentum, Chaikin Volatility, Change of Volatility, ATR, and structure features
-- `eve_app/strategies.py` — candidate strategies, chronological research backtests, strategy selection, and live signals
-- `eve_app/storage.py` — persistent SQLite storage
-- `eve_app/reporting.py` — per-entry trade ledger and statistics
-- `templates/index.html` — Railway-hosted dashboard
-- `tests/` — tested core research, session, and reporting logic
+The `.mq5` source has been statically reviewed here, but MetaEditor is not available in this environment. Compile it with F7 before attachment.

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .storage import Storage, utc_now_ts
-from .strategies import evaluate_candidates, live_signal
+from .strategies import build_playbook_snapshot, evaluate_candidates, evaluate_live_playbook
 
 
 @dataclass(frozen=True)
@@ -16,15 +16,15 @@ class PhaseState:
 
 
 def phase_state(session: dict[str, Any], now: int | None = None) -> PhaseState:
-    now = now or utc_now_ts()
+    current = utc_now_ts() if now is None else int(now)
     started = int(session["started_at"])
     research_end = int(session["research_ends_at"])
     trading_end = int(session["trading_ends_at"])
-    elapsed = max(0, now - started)
-    if now < research_end:
-        return PhaseState("RESEARCH", elapsed, research_end - now)
-    if now < trading_end:
-        return PhaseState("TRADING", elapsed, trading_end - now)
+    elapsed = max(0, current - started)
+    if current < research_end:
+        return PhaseState("RESEARCH", elapsed, research_end - current)
+    if current < trading_end:
+        return PhaseState("TRADING", elapsed, trading_end - current)
     return PhaseState("COMPLETE", elapsed, 0)
 
 
@@ -32,21 +32,24 @@ class CompetitionEngine:
     def __init__(self, storage: Storage) -> None:
         self.storage = storage
 
-    def start_or_resume(self, account_login: str, symbol: str, timeframe: str) -> dict[str, Any]:
-        session = self.storage.get_or_create_session(account_login, symbol, timeframe)
-        if int(session["created_at"]) == int(session["started_at"]):
-            existing_logs = self.storage.session_logs(session["id"], limit=1)
-            if not existing_logs:
-                self.storage.add_log(
-                    session["id"],
-                    "SESSION_STARTED",
-                    "Two-hour XAUUSD competition session started. Research is locked for the first 60 minutes.",
-                    details={
-                        "research_seconds": 3600,
-                        "trading_seconds": 3600,
-                        "timeframe": timeframe,
-                    },
-                )
+    def start_or_resume(
+        self, account_login: str, symbol: str, timeframe: str, launch_id: str
+    ) -> dict[str, Any]:
+        session = self.storage.get_or_create_session(account_login, symbol, timeframe, launch_id)
+        existing_logs = self.storage.session_logs(session["id"], limit=1)
+        if not existing_logs:
+            self.storage.add_log(
+                session["id"],
+                "SESSION_STARTED",
+                "Fresh two-hour competition run started from this EA attachment. Research is locked for 60 minutes.",
+                details={
+                    "research_seconds": 3600,
+                    "trading_seconds": 3600,
+                    "timeframe": timeframe,
+                    "launch_id": launch_id,
+                    "engine_version": "2.00",
+                },
+            )
         return self._session_payload(session)
 
     def process_pulse(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -59,13 +62,17 @@ class CompetitionEngine:
         if bars:
             self.storage.upsert_bars(session_id, bars)
 
-        stored_bars = self.storage.get_bars(session_id, limit=700)
+        stored_bars = self.storage.get_bars(session_id, limit=800)
+        # MT5 sends the currently forming bar as the last row, so [-2] is the last closed M5 candle.
         closed_bar_time = int(stored_bars[-2]["time"]) if len(stored_bars) >= 2 else None
         phase = phase_state(session)
 
         if phase.phase == "RESEARCH":
             if closed_bar_time and closed_bar_time != session.get("last_bar_time") and len(stored_bars) >= 80:
-                scores, _ = evaluate_candidates(stored_bars)
+                evaluation_end = min(utc_now_ts(), int(session["research_ends_at"]))
+                scores, _rows, regime = evaluate_candidates(
+                    stored_bars, int(session["started_at"]), evaluation_end
+                )
                 self.storage.save_candidate_scores(session_id, scores)
                 self.storage.touch_session(session_id, closed_bar_time)
                 leader = scores[0] if scores else None
@@ -73,12 +80,13 @@ class CompetitionEngine:
                     self.storage.add_log(
                         session_id,
                         "RESEARCH_UPDATE",
-                        f"Research ranking updated. Current leader: {leader['label']}.",
+                        f"Research updated. Regime: {regime['name']}. Current playbook leader: {leader['label']}.",
                         details={
                             "leader": leader["name"],
                             "score": leader["score"],
-                            "trades": leader["trades"],
+                            "research_trades": leader["trades"],
                             "net_r": leader["net_r"],
+                            "regime": regime,
                         },
                     )
             else:
@@ -89,20 +97,24 @@ class CompetitionEngine:
 
         if phase.phase in ("TRADING", "COMPLETE") and not session.get("selected_strategy"):
             if len(stored_bars) >= 80:
-                scores, _ = evaluate_candidates(stored_bars)
-                self.storage.save_candidate_scores(session_id, scores)
-                selected = scores[0]
-                snapshot = {
-                    "selected_at": utc_now_ts(),
-                    "selection_basis": "Highest research score at the end of the exact 60-minute research phase",
-                    "ranking": scores,
-                }
-                self.storage.set_selected_strategy(session_id, selected["name"], snapshot)
+                rankings, snapshot = build_playbook_snapshot(
+                    stored_bars,
+                    int(session["started_at"]),
+                    int(session["research_ends_at"]),
+                )
+                self.storage.save_candidate_scores(session_id, rankings)
+                self.storage.set_selected_strategy(session_id, "adaptive_research_playbook", snapshot)
+                top_labels = [item["label"] for item in rankings[:3]]
                 self.storage.add_log(
                     session_id,
-                    "STRATEGY_FROZEN",
-                    f"Research finished. {selected['label']} was frozen for the trading hour.",
-                    details=selected,
+                    "PLAYBOOK_FROZEN",
+                    "Research finished. A ranked multi-strategy playbook was frozen instead of relying on one rare trigger.",
+                    details={
+                        "regime": snapshot.get("regime"),
+                        "top_modules": top_labels,
+                        "playbook": snapshot.get("playbook"),
+                        "minimum_confidence": snapshot.get("minimum_confidence"),
+                    },
                 )
                 session = self.storage.get_session(session_id) or session
 
@@ -112,19 +124,27 @@ class CompetitionEngine:
 
         if phase.phase == "TRADING" and session.get("selected_strategy") and closed_bar_time:
             signal_bar_closed_at = closed_bar_time + 300
-            if signal_bar_closed_at >= int(session["research_ends_at"]) and closed_bar_time != session.get("last_signal_bar_time"):
-                signal = live_signal(
-                    str(session["selected_strategy"]),
+            if (
+                signal_bar_closed_at >= int(session["research_ends_at"])
+                and closed_bar_time != session.get("last_signal_bar_time")
+            ):
+                try:
+                    snapshot = json.loads(session.get("strategy_snapshot_json") or "{}")
+                except json.JSONDecodeError:
+                    snapshot = {}
+                signal, decision = evaluate_live_playbook(
+                    snapshot,
                     stored_bars,
                     float(payload.get("bid", 0)),
                     float(payload.get("ask", 0)),
                 )
                 self.storage.set_last_signal_bar(session_id, closed_bar_time)
+
                 if signal:
                     saved = self.storage.create_signal(
                         session_id=session_id,
                         bar_time=int(signal["bar_time"]),
-                        strategy=str(session["selected_strategy"]),
+                        strategy=str(signal["strategy"]),
                         action=str(signal["action"]),
                         sl=float(signal["sl"]),
                         tp=float(signal["tp"]),
@@ -136,17 +156,30 @@ class CompetitionEngine:
                         self.storage.add_log(
                             session_id,
                             "TRADE_SIGNAL",
-                            f"{signal['action']} signal issued by {signal['strategy_label']}.",
+                            f"{signal['action']} issued by {signal['strategy_label']} at {signal['confidence']:.1f}% evidence confidence.",
                             details={
                                 "signal_id": saved["id"],
                                 "bar_time": signal["bar_time"],
+                                "strategy": signal["strategy"],
                                 "sl": signal["sl"],
                                 "tp": signal["tp"],
                                 "confidence": signal["confidence"],
                                 "reasons": signal["reasons"],
+                                "decision": decision,
                             },
                         )
-                        return self._pulse_payload(self.storage.get_session(session_id) or session, phase_state(session), saved)
+                        return self._pulse_payload(
+                            self.storage.get_session(session_id) or session,
+                            phase_state(session),
+                            saved,
+                        )
+                else:
+                    self.storage.add_log(
+                        session_id,
+                        "M5_HOLD",
+                        "Closed M5 candle assessed; no playbook module had enough directional evidence.",
+                        details=decision,
+                    )
 
         self.storage.touch_session(session_id)
         return self._pulse_payload(self.storage.get_session(session_id) or session, phase_state(session), None)

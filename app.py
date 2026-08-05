@@ -71,7 +71,7 @@ def index():
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "service": "EVE Competition Scalper"})
+    return jsonify({"ok": True, "service": "EVE Competition Scalper", "version": "2.00"})
 
 
 @app.post("/api/session/start")
@@ -82,13 +82,14 @@ def session_start():
         account_login = str(payload.get("account_login", "")).strip()
         symbol = str(payload.get("symbol", "")).strip()
         timeframe = str(payload.get("timeframe", "M5")).strip().upper()
-        if not account_login or not symbol:
-            return Response("ERROR|MISSING_ACCOUNT_OR_SYMBOL", status=400, mimetype="text/plain")
+        launch_id = str(payload.get("launch_id", "")).strip()
+        if not account_login or not symbol or not launch_id:
+            return Response("ERROR|MISSING_ACCOUNT_SYMBOL_OR_LAUNCH_ID", status=400, mimetype="text/plain")
         if not symbol.upper().startswith("XAUUSD"):
             return Response("ERROR|EA_MUST_BE_ATTACHED_TO_XAUUSD", status=400, mimetype="text/plain")
         if timeframe != "M5":
             return Response("ERROR|EA_MUST_BE_ATTACHED_TO_M5", status=400, mimetype="text/plain")
-        session = engine.start_or_resume(account_login, symbol, timeframe)
+        session = engine.start_or_resume(account_login, symbol, timeframe, launch_id)
         return Response(start_wire(session), mimetype="text/plain")
     except Exception as exc:
         app.logger.exception("session start failed")

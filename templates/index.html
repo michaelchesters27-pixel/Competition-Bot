@@ -111,9 +111,9 @@
         </div>
       </div>
       <div class="card">
-        <div class="label">Frozen strategy</div>
+        <div class="label">Frozen research playbook</div>
         <div id="selectedStrategy" class="strategy-name">Research not finished</div>
-        <div id="strategyCopy" class="strategy-copy">The engine compares T3, Squeeze Momentum, Chaikin Volatility, Change of Volatility, ATR and M5 structure combinations during the first hour.</div>
+        <div id="strategyCopy" class="strategy-copy">The engine ranks several M5 entry modules during the first hour. The trading hour can use the best qualifying module on each closed candle instead of waiting for one rare trigger.</div>
       </div>
     </section>
 
@@ -158,7 +158,9 @@
       t3_pullback_resume: 'T3 Pullback Resume',
       volatility_structure_break: 'Volatility Structure Break',
       t3_momentum_continuation: 'T3 Momentum Continuation',
-      squeeze_reversion: 'Squeeze Mean Reversion'
+      squeeze_reversion: 'Squeeze Mean Reversion',
+      adaptive_directional_scalp: 'Adaptive Directional Scalp',
+      adaptive_research_playbook: 'Adaptive Research Playbook'
     }[name] || name || 'Research not finished');
 
     function setPnl(id, value, suffix='') {
@@ -241,7 +243,7 @@
       $('phaseDescription').textContent = s.phase === 'RESEARCH'
         ? 'The engine is observing XAUUSD and ranking candidate M5 strategies. Trading remains physically blocked.'
         : s.phase === 'TRADING'
-          ? 'The research winner is frozen. MT5 now executes qualifying signals at a fixed 0.01 lots.'
+          ? 'The research-ranked playbook is frozen. On every closed M5 candle the strongest qualifying module can execute at 0.01 lots.'
           : 'The two-hour competition window has finished. Existing positions are not forcibly closed.';
       const phaseProgress = s.phase === 'RESEARCH' ? Math.min(100, s.elapsed_seconds/3600*100)
         : s.phase === 'TRADING' ? Math.min(100, (s.elapsed_seconds-3600)/3600*100) : 100;
@@ -252,7 +254,7 @@
       $('startedAt').textContent=fmtTime(s.started_at);
       $('selectedStrategy').textContent=strategyLabel(s.selected_strategy);
       $('strategyCopy').textContent = s.selected_strategy
-        ? 'This strategy was selected from the research ranking and remains frozen throughout the trading hour.'
+        ? 'The module priority and research regime are frozen, while the best qualifying entry type may trade each closed M5 candle.'
         : 'The research engine is still comparing the candidate strategies.';
 
       const st=data.stats;
