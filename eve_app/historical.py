@@ -6,6 +6,8 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable
+
+from .memory import bounded_tail
 from urllib.parse import urlparse
 
 Bar = dict[str, Any]
@@ -70,6 +72,7 @@ class HistoricalConfig:
     lookback_days: int | None = None
     chunk_days: int = 30
     timeout_seconds: int = 20
+    max_m5_bars: int = 5000
     enabled: bool = True
 
     @classmethod
@@ -102,6 +105,7 @@ class HistoricalConfig:
             lookback_days=lookback_days,
             chunk_days=max(1, int(_env("EVE_HISTORICAL_CHUNK_DAYS", "30"))),
             timeout_seconds=int(_env("EVE_HISTORICAL_QUERY_TIMEOUT_SECONDS", "20")),
+            max_m5_bars=max(120, int(_env("EVE_HISTORICAL_MAX_M5_BARS", "5000"))),
             enabled=enabled,
         )
 
@@ -309,7 +313,7 @@ class SupabaseMarketCandles:
         m5: list[Bar] = []
         processed = 0
         for chunk in self._iter_chunks(query_symbol, self.config.m5_value, start_ts, end_ts):
-            m5.extend(chunk)
+            m5 = bounded_tail([*m5, *chunk], self.config.max_m5_bars)
             processed += len(chunk)
             logger.info(
                 "historical research progress",
@@ -323,9 +327,11 @@ class SupabaseMarketCandles:
             del chunk
         m5 = normalize_bars(m5)
         source = "STORED_M5"
-        m1_window_provider = (
-            lambda window_start, window_end: self._fetch_window(query_symbol, self.config.m1_value, int(window_start), int(window_end))
-        ) if earliest_m1 is not None else None
+        m1_window_provider = None
+        if earliest_m1 is not None:
+            def m1_window_provider(window_start: int, window_end: int) -> list[Bar]:
+                return self._fetch_window(query_symbol, self.config.m1_value, int(window_start), int(window_end))
+
         valid = bool(m5)
         reason = "OK" if valid else "No completed M5 candles available and M1 fallback unavailable"
         return HistoricalDataset(
@@ -347,6 +353,8 @@ class SupabaseMarketCandles:
                 "preferred_source": self.config.preferred_source if self.config.filter_preferred_source else "DISABLED",
                 "lookback_days": self.config.lookback_days,
                 "chunk_days": self.config.chunk_days,
+                "max_m5_bars": self.config.max_m5_bars,
+                "m5_candles_processed": processed,
                 "start_ts": start_ts,
                 "end_ts": end_ts,
                 "m5_bars": len(m5),

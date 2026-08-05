@@ -4,6 +4,8 @@ import math
 from statistics import pstdev
 from typing import Any
 
+from .memory import bounded_tail
+
 
 def sma(values: list[float], period: int) -> list[float | None]:
     out: list[float | None] = [None] * len(values)
@@ -222,7 +224,8 @@ def recent_breakout(bars: list[dict[str, Any]], index: int, lookback: int = 6) -
     return close > prior_high, close < prior_low
 
 
-def build_feature_rows(bars: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def build_feature_rows(bars: list[dict[str, Any]], max_rows: int | None = None) -> list[dict[str, Any]]:
+    bars = bounded_tail(sorted(bars, key=lambda bar: int(bar["time"])), max_rows)
     if not bars:
         return []
     closes = [float(b["close"]) for b in bars]

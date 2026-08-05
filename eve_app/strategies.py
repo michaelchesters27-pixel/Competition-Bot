@@ -7,6 +7,7 @@ from statistics import mean
 from typing import Any, Callable
 
 from .indicators import build_feature_rows, finite
+from .memory import compact_trade_summary
 
 SignalFn = Callable[[list[dict[str, Any]], int], dict[str, Any] | None]
 ExecutionRows = list[dict[str, Any]] | Callable[[int, int], list[dict[str, Any]]]
@@ -15,6 +16,8 @@ logger = logging.getLogger(__name__)
 
 TARGET_PROFIT_FACTOR = 2.10
 MAX_STRATEGY_CORRELATION = 0.72
+MAX_RESEARCH_FEATURE_ROWS = 5000
+MAX_SIGNAL_VECTOR_POINTS = 1200
 MIN_WALK_FORWARD_FOLDS = 3
 MIN_OUT_OF_SAMPLE_TRADES = 200
 ASSUMED_SLIPPAGE_ATR = 0.015
@@ -352,9 +355,8 @@ def backtest_candidate(candidate: CandidateStrategy, rows: list[dict[str, Any]],
     if not wf.get("completed"): rejection_reasons.append("incomplete walk-forward validation")
     if oos_trades < MIN_OUT_OF_SAMPLE_TRADES: rejection_reasons.append(f"fewer than {MIN_OUT_OF_SAMPLE_TRADES} completed out-of-sample trades")
     status = "INSUFFICIENT_EVIDENCE" if rejection_reasons else "ACCEPTED"
-    m1_count = sum(1 for t in trades if t.get("execution_source") == "M1")
-    m5_count = sum(1 for t in trades if t.get("execution_source") == "M5")
-    return {"name": candidate.name, "label": candidate.label, "family": candidate.family, "indicators": list(candidate.indicators), "score": round(score, 3), "status": status, "accepted": status == "ACCEPTED", "rejection_reason": "; ".join(rejection_reasons), "oos_trades": oos_trades, "m1_trade_simulation_count": m1_count, "m5_fallback_trade_simulation_count": m5_count, "trades": len(trades), "wins": int(m["wins"]), "losses": int(m["losses"]), "win_rate": round(m["win_rate"], 2), "profit_factor": round(m["profit_factor"], 3), "net_r": round(m["net_r"], 3), "average_r": round(m["average_r"], 3), "oos_expectancy": round(wf["oos_expectancy"], 3), "oos_profit_factor": round(wf["oos_profit_factor"], 3), "profit_factor_target": TARGET_PROFIT_FACTOR, "walk_forward": wf, "max_drawdown_r": round(dd, 3), "max_hold_bars": candidate.max_hold_bars, "trade_examples": trades[-5:]}
+    summary = compact_trade_summary(trades)
+    return {"name": candidate.name, "label": candidate.label, "family": candidate.family, "indicators": list(candidate.indicators), "score": round(score, 3), "status": status, "accepted": status == "ACCEPTED", "rejection_reason": "; ".join(rejection_reasons), "oos_trades": oos_trades, "m1_trade_simulation_count": summary["m1_trade_simulation_count"], "m5_fallback_trade_simulation_count": summary["m5_fallback_trade_simulation_count"], "trades": len(trades), "wins": int(m["wins"]), "losses": int(m["losses"]), "win_rate": round(m["win_rate"], 2), "profit_factor": round(m["profit_factor"], 3), "net_r": round(m["net_r"], 3), "average_r": round(m["average_r"], 3), "oos_expectancy": round(wf["oos_expectancy"], 3), "oos_profit_factor": round(wf["oos_profit_factor"], 3), "profit_factor_target": TARGET_PROFIT_FACTOR, "walk_forward": wf, "max_drawdown_r": round(dd, 3), "max_hold_bars": candidate.max_hold_bars, "trade_summary": summary, "trade_examples": summary["trade_examples"]}
 
 
 def _pearson(a: list[float], b: list[float]) -> float:
@@ -366,7 +368,7 @@ def _pearson(a: list[float], b: list[float]) -> float:
 
 def _signal_vector(candidate: CandidateStrategy, rows: list[dict[str, Any]], indices: list[int]) -> list[float]:
     out = []
-    for i in indices:
+    for i in indices[-MAX_SIGNAL_VECTOR_POINTS:]:
         sig = candidate.signal_fn(rows, i)
         out.append(1.0 if sig and sig["action"] == "BUY" else -1.0 if sig and sig["action"] == "SELL" else 0.0)
     return out
@@ -396,7 +398,7 @@ def _indicator_correlation(rows: list[dict[str, Any]], indices: list[int]) -> di
 
 
 def evaluate_candidates(bars: list[dict[str, Any]], start_time: int | None = None, end_time: int | None = None, execution_bars: ExecutionRows | None = None, metadata: dict[str, Any] | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
-    rows = build_feature_rows(bars)
+    rows = build_feature_rows(bars, max_rows=MAX_RESEARCH_FEATURE_ROWS)
     if not rows: return [], [], {"name": "UNCLASSIFIED"}
     start_time = int(start_time if start_time is not None else rows[max(0, len(rows) - 14)]["time"])
     end_time = int(end_time if end_time is not None else int(rows[-1]["time"]) + 300)
@@ -422,6 +424,7 @@ def evaluate_candidates(bars: list[dict[str, Any]], start_time: int | None = Non
     regime["candidate_families_tested"] = len(CANDIDATES)
     regime["objective"] = "statistically rigorous edge discovery using chronological TRAIN_VALIDATION_TEST walk-forward validation"
     regime["minimum_oos_trades"] = MIN_OUT_OF_SAMPLE_TRADES
+    regime["bounded_memory"] = {"feature_rows_limit": MAX_RESEARCH_FEATURE_ROWS, "signal_vector_points": min(len(indices), MAX_SIGNAL_VECTOR_POINTS)}
     regime["historical_data"] = metadata or {}
     return results, rows, regime
 
