@@ -56,10 +56,11 @@ class CompetitionEngine:
             dataset = self.historical_source.get_research_dataset(str(session["symbol"]), end_ts)
             if dataset.valid:
                 return dataset
+            reason = str(dataset.metadata.get("reason") or "Historical dataset is invalid")
             self.storage.add_log(
                 session["id"],
                 "HISTORICAL_DATA_UNAVAILABLE",
-                "Historical candle database did not return a valid research dataset; research promotion is disabled.",
+                f"Historical dataset rejected: {reason}",
                 level="WARNING",
                 details=dataset.metadata,
             )
