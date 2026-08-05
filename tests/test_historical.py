@@ -34,6 +34,16 @@ def test_default_interval_values_match_market_candles_schema():
     assert config.m5_value == "5min"
 
 
+def test_env_m5_limit_is_capped_at_5000(monkeypatch):
+    monkeypatch.setenv("EVE_MARKET_CANDLES_DATABASE_URL", "postgresql://reader@example/db")
+    monkeypatch.setenv("EVE_HISTORICAL_MAX_M5_BARS", "9000")
+
+    config = HistoricalConfig.from_env()
+
+    assert config is not None
+    assert config.max_m5_bars == 5000
+
+
 def test_earliest_time_uses_supabase_interval_literal_by_default():
     config = HistoricalConfig(database_url="postgresql://reader@example/db")
     source = _source(config)
@@ -265,21 +275,17 @@ def test_symbol_value_override_is_used_for_historical_queries():
         earliest_calls.append((symbol, timeframe))
         return 1_700_000_000 if timeframe == "5min" else None
 
-    def fake_iter_chunks(symbol, timeframe, start_ts, end_ts):
-        fetch_calls.append((symbol, timeframe, start_ts, end_ts))
-        if timeframe == "5min":
-            yield [{"time": start_ts, "open": 1, "high": 2, "low": 0, "close": 1, "tick_volume": 1, "spread": 0}]
-        else:
-            yield []
-
     source.earliest_time = fake_earliest
-    source._iter_chunks = fake_iter_chunks
+    source._fetch_latest_completed_m5 = lambda symbol, end_ts, use_source_filter=True: (
+        fetch_calls.append((symbol, "5min", end_ts, use_source_filter))
+        or [{"time": 1_700_000_000, "open": 1, "high": 2, "low": 0, "close": 1, "tick_volume": 1, "spread": 0}]
+    )
 
     dataset = source.get_research_dataset("XAUUSD", 1_700_000_300)
 
     assert dataset.valid
     assert earliest_calls == [("XAU/USD", "5min"), ("XAU/USD", "1min")]
-    assert fetch_calls == [("XAU/USD", "5min", 1_700_000_000, 1_700_000_300)]
+    assert fetch_calls == [("XAU/USD", "5min", 1_700_000_300, True)]
     assert dataset.metadata["requested_symbol"] == "XAUUSD"
     assert dataset.metadata["query_symbol"] == "XAU/USD"
     assert dataset.metadata["m5_interval"] == "5min"
@@ -303,21 +309,17 @@ def test_xauusd_falls_back_to_slash_symbol_for_historical_queries():
             return 1_700_000_000
         return None
 
-    def fake_iter_chunks(symbol, timeframe, start_ts, end_ts):
-        fetch_calls.append((symbol, timeframe, start_ts, end_ts))
-        if symbol == "XAU/USD" and timeframe == "5min":
-            yield [{"time": start_ts, "open": 1, "high": 2, "low": 0, "close": 1, "tick_volume": 1, "spread": 0}]
-        else:
-            yield []
-
     source.earliest_time = fake_earliest
-    source._iter_chunks = fake_iter_chunks
+    source._fetch_latest_completed_m5 = lambda symbol, end_ts, use_source_filter=True: (
+        fetch_calls.append((symbol, "5min", end_ts, use_source_filter))
+        or [{"time": 1_700_000_000, "open": 1, "high": 2, "low": 0, "close": 1, "tick_volume": 1, "spread": 0}]
+    )
 
     dataset = source.get_research_dataset("XAUUSD", 1_700_000_300)
 
     assert dataset.valid
     assert earliest_calls == [("XAUUSD", "5min"), ("XAUUSD", "1min"), ("XAU/USD", "5min"), ("XAU/USD", "1min")]
-    assert fetch_calls == [("XAU/USD", "5min", 1_700_000_000, 1_700_000_300)]
+    assert fetch_calls == [("XAU/USD", "5min", 1_700_000_300, True)]
     assert dataset.metadata["requested_symbol"] == "XAUUSD"
     assert dataset.metadata["query_symbol"] == "XAU/USD"
     assert dataset.metadata["earliest_m5"] == 1_700_000_000
@@ -337,6 +339,9 @@ def test_research_dataset_does_not_retain_complete_m1_history():
         return [{"time": start_ts, "open": 1, "high": 2, "low": 0, "close": 1, "tick_volume": 1, "spread": 0}]
 
     source._fetch = fake_fetch
+    source._fetch_latest_completed_m5 = lambda symbol, end_ts, use_source_filter=True: fake_fetch(
+        symbol, "5min", 1_700_000_000, end_ts, use_source_filter
+    )
 
     dataset = source.get_research_dataset("XAUUSD", 1_700_000_300)
 
@@ -463,6 +468,43 @@ def test_failed_historical_connection_cannot_promote_strategy(tmp_path):
     assert any(log["event"] == "HISTORICAL_DATA_UNAVAILABLE" for log in logs)
 
 
+def test_latest_m5_query_orders_desc_limits_and_reverses_chronologically():
+    config = HistoricalConfig(database_url="postgresql://reader@example/db", max_m5_bars=5000)
+    source = _source(config)
+    captured = {}
+
+    rows = [
+        {"time": datetime(2024, 1, 1, 0, 10, tzinfo=timezone.utc), "open": 3, "high": 4, "low": 2, "close": 3, "tick_volume": 1, "spread": 0},
+        {"time": datetime(2024, 1, 1, 0, 5, tzinfo=timezone.utc), "open": 2, "high": 3, "low": 1, "close": 2, "tick_volume": 1, "spread": 0},
+    ]
+
+    class Tx:
+        def __enter__(self): return None
+        def __exit__(self, *args): return False
+
+    class Rows:
+        def fetchall(self): return rows
+
+    class Conn:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def transaction(self): return Tx()
+        def execute(self, sql, params=None):
+            if params and "limit" in params:
+                captured["sql"] = sql
+                captured["params"] = params
+            return Rows()
+
+    source._connect = lambda: Conn()
+
+    bars = source._fetch_latest_completed_m5("XAUUSD", 1_704_067_200)
+
+    assert 'ORDER BY "candle_time" DESC' in captured["sql"]
+    assert "LIMIT %(limit)s" in captured["sql"]
+    assert captured["params"]["limit"] == 5000
+    assert [bar["time"] for bar in bars] == [1_704_067_500, 1_704_067_800]
+
+
 def test_historical_dataset_bounds_retained_m5_history():
     config = HistoricalConfig(
         database_url="postgresql://reader@example/db",
@@ -474,18 +516,10 @@ def test_historical_dataset_bounds_retained_m5_history():
     source = _source(config)
     source.earliest_time = lambda symbol, timeframe: 1_700_000_000 if timeframe == "5min" else None
 
-    def fake_iter_chunks(symbol, timeframe, start_ts, end_ts):
-        midpoint = start_ts + 300 * 100
-        yield [
-            {"time": start_ts + i * 300, "open": 1, "high": 2, "low": 0, "close": 1, "tick_volume": 1, "spread": 0}
-            for i in range(100)
-        ]
-        yield [
-            {"time": midpoint + i * 300, "open": 1, "high": 2, "low": 0, "close": 1, "tick_volume": 1, "spread": 0}
-            for i in range(100)
-        ]
-
-    source._iter_chunks = fake_iter_chunks
+    source._fetch_latest_completed_m5 = lambda symbol, end_ts, use_source_filter=True: [
+        {"time": 1_700_000_000 + i * 300, "open": 1, "high": 2, "low": 0, "close": 1, "tick_volume": 1, "spread": 0}
+        for i in range(80, 200)
+    ]
 
     dataset = source.get_research_dataset("XAUUSD", 1_700_000_000 + 300 * 200)
 
@@ -493,4 +527,4 @@ def test_historical_dataset_bounds_retained_m5_history():
     assert len(dataset.m5_bars) == 120
     assert dataset.m5_bars[0]["time"] == 1_700_000_000 + 300 * 80
     assert dataset.metadata["max_m5_bars"] == 120
-    assert dataset.metadata["m5_candles_processed"] == 200
+    assert dataset.metadata["m5_candles_processed"] == 120
