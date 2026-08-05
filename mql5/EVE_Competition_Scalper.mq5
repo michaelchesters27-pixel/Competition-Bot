@@ -115,17 +115,25 @@ int PostJson(string endpoint,string body,string &response)
 
    ResetLastError();
    int status=WebRequest("POST",url,headers,15000,payload,result,response_headers);
+   int last_error=GetLastError();
    response=CharArrayToString(result,0,-1,CP_UTF8);
 
    if(status==-1)
    {
-      int error=GetLastError();
-      Print("EVE WebRequest failed. Error ",error,
+      Print("EVE MT5 WebRequest failure. URL=",url,
+            " WebRequest return=",status,
+            " GetLastError=",last_error,
+            " Response body=",response,
+            " Response headers=",response_headers,
             ". Add this URL in MT5: Tools > Options > Expert Advisors > Allow WebRequest: ",base);
    }
    else if(status<200 || status>=300)
    {
-      Print("EVE server returned HTTP ",status,": ",response);
+      Print("EVE WebRequest returned non-2xx result. URL=",url,
+            " WebRequest return=",status,
+            " GetLastError=",last_error,
+            " Response body=",response,
+            " Response headers=",response_headers);
    }
    return status;
 }
