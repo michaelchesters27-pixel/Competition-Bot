@@ -51,16 +51,22 @@ def test_historical_check_returns_database_visibility(monkeypatch):
         def transaction(self): return Tx()
         def execute(self, sql, params=None):
             calls.append((sql, params))
+            if "current_database" in sql:
+                return Rows({"current_database": "market_db"})
             if "current_schema" in sql:
                 return Rows({"current_schema": "public"})
-            if "COUNT(*) AS count FROM public.market_candles" in sql:
-                return Rows({"count": 479069})
-            if "MIN(candle_time)" in sql:
+            if "current_user" in sql:
+                return Rows({"current_user": "readonly_user"})
+            if "COUNT(*) AS total_rows" in sql:
+                return Rows({"total_rows": 479069})
+            if "COUNT(*) AS matching_rows" in sql:
                 return Rows({
-                    "min_candle_time": "2024-01-01 00:00:00+00",
-                    "max_candle_time": "2026-08-05 00:00:00+00",
-                    "count": 479069,
+                    "matching_rows": 12345,
+                    "earliest": "2024-01-01 00:00:00+00",
+                    "latest": "2026-08-05 00:00:00+00",
                 })
+            if "SELECT MIN(candle_time)" in sql:
+                return Rows({"min": "2024-01-01 00:00:00+00"})
             return Rows({})
 
     class Psycopg:
@@ -86,24 +92,19 @@ def test_historical_check_returns_database_visibility(monkeypatch):
 
     assert response.status_code == 200
     payload = response.get_json()
-    assert payload["database_host"] == "db.example.com"
-    assert payload["database_name"] == "market_db"
-    assert payload["current_schema"] == "public"
-    assert payload["market_candles_count"] == 479069
-    assert payload["xauusd_5min_completed"] == {
-        "min_candle_time": "2024-01-01 00:00:00+00",
-        "max_candle_time": "2026-08-05 00:00:00+00",
-        "count": 479069,
+    assert payload == {
+        "current_database": "market_db",
+        "current_schema": "public",
+        "current_user": "readonly_user",
+        "total_rows": 479069,
+        "matching_rows": 12345,
+        "earliest": "2024-01-01 00:00:00+00",
+        "latest": "2026-08-05 00:00:00+00",
+        "earliest_time_result": "2024-01-01 00:00:00+00",
+        "database_exception": None,
     }
-    assert payload["configured"] == {
-        "table": "public.market_candles",
-        "symbol": "XAU/USD",
-        "m5_value": "5min",
-        "m1_value": "1min",
-    }
-    assert payload["database_exception"] is None
-    assert any("WHERE symbol = 'XAU/USD'" in sql for sql, _params in calls)
-    assert all(params is None or isinstance(params, tuple) for _sql, params in calls)
+    assert any("WHERE symbol='XAU/USD'" in sql for sql, _params in calls)
+    assert any(params == {"symbol": "XAU/USD", "timeframe": "5min"} for _sql, params in calls)
 
 
 def test_historical_check_returns_database_exception(monkeypatch):

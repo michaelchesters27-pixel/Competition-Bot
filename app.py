@@ -69,56 +69,70 @@ def pulse_wire(payload: dict[str, Any]) -> str:
 def _historical_check_payload() -> dict[str, Any]:
     config = HistoricalConfig.from_env()
     payload: dict[str, Any] = {
-        "database_host": "",
-        "database_name": "",
+        "current_database": None,
         "current_schema": None,
-        "market_candles_count": None,
-        "xauusd_5min_completed": {"min_candle_time": None, "max_candle_time": None, "count": None},
-        "configured": {"table": None, "symbol": None, "m5_value": None, "m1_value": None},
+        "current_user": None,
+        "total_rows": None,
+        "matching_rows": None,
+        "earliest": None,
+        "latest": None,
+        "earliest_time_result": None,
         "database_exception": None,
     }
     if config is None:
         payload["database_exception"] = "Historical database is not configured"
         return payload
 
-    identity = _safe_database_identity(config.database_url)
-    payload["database_host"] = identity["host"]
-    payload["database_name"] = identity["database"]
-    payload["configured"] = {
-        "table": config.table,
-        "symbol": config.symbol_value,
-        "m5_value": config.m5_value,
-        "m1_value": config.m1_value,
-    }
+    def serialize_database_value(value: Any) -> Any:
+        return str(value) if value is not None else None
 
     try:
         psycopg = importlib.import_module("psycopg")
         rows_module = importlib.import_module("psycopg.rows")
         with psycopg.connect(config.database_url, row_factory=rows_module.dict_row) as conn:
             conn.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
-            conn.execute("SET statement_timeout = %s", (config.timeout_seconds * 1000,))
             with conn.transaction():
-                schema_row = conn.execute("SELECT current_schema() AS current_schema").fetchone()
-                count_row = conn.execute("SELECT COUNT(*) AS count FROM public.market_candles").fetchone()
-                range_row = conn.execute(
+                database_row = conn.execute("SELECT current_database();").fetchone()
+                schema_row = conn.execute("SELECT current_schema();").fetchone()
+                user_row = conn.execute("SELECT current_user;").fetchone()
+                total_row = conn.execute(
                     """
-                    SELECT MIN(candle_time) AS min_candle_time,
-                           MAX(candle_time) AS max_candle_time,
-                           COUNT(*) AS count
-                    FROM public.market_candles
-                    WHERE symbol = 'XAU/USD'
-                      AND interval = '5min'
-                      AND is_complete = true
+                    SELECT COUNT(*) AS total_rows
+                    FROM public.market_candles;
                     """
                 ).fetchone()
+                matching_row = conn.execute(
+                    """
+                    SELECT
+                    COUNT(*) AS matching_rows,
+                    MIN(candle_time) AS earliest,
+                    MAX(candle_time) AS latest
+                    FROM public.market_candles
+                    WHERE symbol='XAU/USD'
+                    AND interval='5min'
+                    AND is_complete=true;
+                    """
+                ).fetchone()
+                earliest_time_row = conn.execute(
+                    """
+                    SELECT MIN(candle_time)
+                    FROM public.market_candles
+                    WHERE symbol=%(symbol)s
+                    AND interval=%(timeframe)s
+                    AND is_complete=true;
+                    """,
+                    {"symbol": "XAU/USD", "timeframe": "5min"},
+                ).fetchone()
+        payload["current_database"] = database_row["current_database"] if database_row else None
         payload["current_schema"] = schema_row["current_schema"] if schema_row else None
-        payload["market_candles_count"] = int(count_row["count"]) if count_row else None
-        if range_row:
-            payload["xauusd_5min_completed"] = {
-                "min_candle_time": str(range_row["min_candle_time"]) if range_row["min_candle_time"] is not None else None,
-                "max_candle_time": str(range_row["max_candle_time"]) if range_row["max_candle_time"] is not None else None,
-                "count": int(range_row["count"]),
-            }
+        payload["current_user"] = user_row["current_user"] if user_row else None
+        payload["total_rows"] = int(total_row["total_rows"]) if total_row else None
+        if matching_row:
+            payload["matching_rows"] = int(matching_row["matching_rows"])
+            payload["earliest"] = serialize_database_value(matching_row["earliest"])
+            payload["latest"] = serialize_database_value(matching_row["latest"])
+        if earliest_time_row:
+            payload["earliest_time_result"] = serialize_database_value(earliest_time_row["min"])
     except Exception as exc:
         payload["database_exception"] = clean_field(exc)
     return payload
