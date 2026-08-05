@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import math
 import tempfile
+import threading
 import time
 from pathlib import Path
 
 from eve_app.engine import CompetitionEngine, phase_state
 from eve_app.historical import HistoricalDataset
+from eve_app.reporting import build_dashboard
 from eve_app.storage import Storage
-from eve_app.strategies import build_playbook_snapshot, evaluate_candidates, evaluate_live_playbook
+from eve_app.strategies import TOTAL_CANDIDATES, build_playbook_snapshot, evaluate_candidates, evaluate_live_playbook
 
 
 def synthetic_bars(count: int = 420, start: int | None = None, direction: float = 0.20):
@@ -53,14 +55,41 @@ def test_candidate_evaluation_returns_ranked_playbook():
     end = bars[-1]["time"] + 300
     start = end - 3600
     results, rows, regime = evaluate_candidates(bars, start, end)
-    assert len(results) >= 25
-    assert regime["candidate_families_tested"] >= 25
+    assert len(results) == TOTAL_CANDIDATES
+    assert regime["candidate_families_tested"] == TOTAL_CANDIDATES
     assert "indicator_correlation" in regime
     assert all("oos_expectancy" in result for result in results)
     assert all("correlation_status" in result for result in results)
     assert len(rows) == 420
     assert results == sorted(results, key=lambda result: result["score"], reverse=True)
     assert regime["name"] in {"TREND_UP", "TREND_DOWN", "EXPANSION", "COMPRESSION", "RANGE_MIXED"}
+
+
+def test_dashboard_progress_is_persisted_after_every_candidate():
+    with tempfile.TemporaryDirectory() as tmp:
+        storage = Storage(str(Path(tmp) / "test.db"))
+        session = storage.get_or_create_session("12345", "XAUUSD", "M5", "launch-progress")
+        observed = []
+
+        def persist(values):
+            storage.save_research_progress(
+                session["id"],
+                **values,
+                stage="candidate_evaluation",
+                estimated_seconds_remaining=TOTAL_CANDIDATES - values["candidates_completed"],
+            )
+            dashboard_progress = build_dashboard(storage, session["id"])["research_progress"]
+            observed.append(dashboard_progress)
+
+        evaluate_candidates(synthetic_bars(), progress=persist)
+
+        assert [item["candidates_completed"] for item in observed] == list(range(1, TOTAL_CANDIDATES + 1))
+        assert all(item["total_candidates"] == TOTAL_CANDIDATES for item in observed)
+        assert all(item["stage"] == "candidate_evaluation" for item in observed)
+        assert all(item["walk_forward_folds_completed"] >= index for index, item in enumerate(observed, start=1))
+        assert all(item["best_profit_factor"] is not None for item in observed)
+        assert all(item["best_win_rate"] is not None for item in observed)
+        assert all(item["best_average_r"] is not None for item in observed)
 
 
 def test_new_attachment_launch_id_creates_fresh_session():
@@ -77,7 +106,7 @@ def test_new_attachment_launch_id_creates_fresh_session():
         assert phase_state(session).phase == "RESEARCH"
 
 
-def test_research_pulse_stores_actual_window_ranking():
+def test_research_pulse_stores_actual_window_ranking_in_background():
     with tempfile.TemporaryDirectory() as tmp:
         storage = Storage(str(Path(tmp) / "test.db"))
         started_bars = synthetic_bars()
@@ -96,9 +125,119 @@ def test_research_pulse_stores_actual_window_ranking():
         )
         assert result["phase"] == "RESEARCH"
         assert result["action"] == "HOLD"
-        scores = storage.latest_candidate_scores(started["session_id"])
-        assert len(scores) >= 25
+
+        deadline = time.time() + 5
+        scores = []
+        events = set()
+        while time.time() < deadline:
+            scores = storage.latest_candidate_scores(started["session_id"])
+            events = {log["event"] for log in storage.session_logs(started["session_id"], limit=20)}
+            if scores and "RESEARCH_COMPLETED" in events:
+                break
+            time.sleep(0.05)
+
+        assert len(scores) == TOTAL_CANDIDATES
         assert all("oos_profit_factor" in score for score in scores)
+        assert "RESEARCH_JOB_STARTED" in events
+        assert "RESEARCH_STAGE_PROGRESS" in events
+        assert "RESEARCH_COMPLETED" in events
+        progress = storage.research_progress(started["session_id"])
+        assert progress is not None
+        assert progress["candidates_completed"] == TOTAL_CANDIDATES
+        assert progress["total_candidates"] == TOTAL_CANDIDATES
+        assert progress["stage"] == "completed"
+        assert progress["estimated_seconds_remaining"] == 0
+
+
+def test_pulse_returns_promptly_while_research_runs_in_background():
+    class SlowHistoricalSource:
+        def __init__(self, bars):
+            self.bars = bars
+            self.started = threading.Event()
+            self.release = threading.Event()
+            self.calls = 0
+
+        def get_research_dataset(self, symbol, end_ts):
+            self.calls += 1
+            self.started.set()
+            assert self.release.wait(timeout=5)
+            return HistoricalDataset(
+                m5_bars=[bar for bar in self.bars if int(bar["time"]) < int(end_ts)],
+                m1_bars=[],
+                metadata={"valid": True, "source": "TEST"},
+            )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        storage = Storage(str(Path(tmp) / "test.db"))
+        started_bars = synthetic_bars()
+        source = SlowHistoricalSource(started_bars)
+        engine = CompetitionEngine(storage, source)
+        started = engine.start_or_resume("12345", "XAUUSD", "M5", "launch-a")
+        session = storage.get_session(started["session_id"])
+        assert session is not None
+        bars = synthetic_bars(start=int(session["started_at"]) - 408 * 300)
+
+        begin = time.monotonic()
+        result = engine.process_pulse(
+            {
+                "session_id": started["session_id"],
+                "bid": bars[-1]["close"] - 0.05,
+                "ask": bars[-1]["close"] + 0.05,
+                "bars": bars,
+            }
+        )
+        elapsed = time.monotonic() - begin
+
+        assert elapsed < 2
+        assert result["phase"] == "RESEARCH"
+        assert result["action"] == "HOLD"
+        assert source.started.wait(timeout=2)
+        assert source.calls == 1
+
+        second = engine.process_pulse(
+            {
+                "session_id": started["session_id"],
+                "bid": bars[-1]["close"] - 0.05,
+                "ask": bars[-1]["close"] + 0.05,
+                "bars": bars,
+            }
+        )
+        assert second["action"] == "HOLD"
+        assert source.calls == 1
+
+        source.release.set()
+        deadline = time.time() + 5
+        while time.time() < deadline and not storage.latest_candidate_scores(started["session_id"]):
+            time.sleep(0.05)
+
+        assert storage.latest_candidate_scores(started["session_id"])
+
+
+def test_background_research_failures_are_logged():
+    class BrokenHistoricalSource:
+        def get_research_dataset(self, symbol, end_ts):
+            raise RuntimeError("database unavailable")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        storage = Storage(str(Path(tmp) / "test.db"))
+        engine = CompetitionEngine(storage, BrokenHistoricalSource())
+        started = engine.start_or_resume("12345", "XAUUSD", "M5", "launch-a")
+        session = storage.get_session(started["session_id"])
+        assert session is not None
+        bars = synthetic_bars(start=int(session["started_at"]) - 408 * 300)
+
+        result = engine.process_pulse({"session_id": started["session_id"], "bid": 1, "ask": 2, "bars": bars})
+
+        assert result["action"] == "HOLD"
+        deadline = time.time() + 5
+        events = set()
+        while time.time() < deadline:
+            events = {log["event"] for log in storage.session_logs(started["session_id"], limit=20)}
+            if "HISTORICAL_DATA_UNAVAILABLE" in events and "RESEARCH_FAILED" in events:
+                break
+            time.sleep(0.05)
+        assert "HISTORICAL_DATA_UNAVAILABLE" in events
+        assert "RESEARCH_FAILED" in events
 
 
 def test_playbook_freezes_and_live_model_can_issue_signal():

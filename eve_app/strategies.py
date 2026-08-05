@@ -10,6 +10,7 @@ from .indicators import build_feature_rows, finite
 from .memory import compact_trade_summary
 
 SignalFn = Callable[[list[dict[str, Any]], int], dict[str, Any] | None]
+ProgressFn = Callable[[dict[str, Any]], None]
 ExecutionRows = list[dict[str, Any]] | Callable[[int, int], list[dict[str, Any]]]
 
 logger = logging.getLogger(__name__)
@@ -205,6 +206,7 @@ _FAMILIES: list[tuple[str, str, int, tuple[str, ...]]] = [
 ]
 
 CANDIDATES = [CandidateStrategy(name, label, hold, _signal_family(name), name, indicators) for name, label, hold, indicators in _FAMILIES]
+TOTAL_CANDIDATES = len(CANDIDATES)
 
 
 def candidate_by_name(name: str) -> CandidateStrategy:
@@ -397,7 +399,7 @@ def _indicator_correlation(rows: list[dict[str, Any]], indices: list[int]) -> di
     return out
 
 
-def evaluate_candidates(bars: list[dict[str, Any]], start_time: int | None = None, end_time: int | None = None, execution_bars: ExecutionRows | None = None, metadata: dict[str, Any] | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+def evaluate_candidates(bars: list[dict[str, Any]], start_time: int | None = None, end_time: int | None = None, execution_bars: ExecutionRows | None = None, metadata: dict[str, Any] | None = None, progress: ProgressFn | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     rows = build_feature_rows(bars, max_rows=MAX_RESEARCH_FEATURE_ROWS)
     if not rows: return [], [], {"name": "UNCLASSIFIED"}
     start_time = int(start_time if start_time is not None else rows[max(0, len(rows) - 14)]["time"])
@@ -406,6 +408,23 @@ def evaluate_candidates(bars: list[dict[str, Any]], start_time: int | None = Non
     results = []
     for completed, candidate in enumerate(CANDIDATES, start=1):
         results.append(backtest_candidate(candidate, rows, start_time, end_time, str(regime["name"]), execution_bars))
+        if progress:
+            best = max(
+                results,
+                key=lambda item: (
+                    float(item["oos_expectancy"]),
+                    float(item["oos_profit_factor"]),
+                    float(item["score"]),
+                ),
+            )
+            progress({
+                "candidates_completed": completed,
+                "total_candidates": TOTAL_CANDIDATES,
+                "walk_forward_folds_completed": sum(len(item["walk_forward"]["folds"]) for item in results),
+                "best_profit_factor": float(best["oos_profit_factor"]),
+                "best_win_rate": float(best["win_rate"]),
+                "best_average_r": float(best["average_r"]),
+            })
         logger.info(
             "historical research progress",
             extra={
@@ -429,8 +448,8 @@ def evaluate_candidates(bars: list[dict[str, Any]], start_time: int | None = Non
     return results, rows, regime
 
 
-def build_playbook_snapshot(bars: list[dict[str, Any]], research_start: int, research_end: int, execution_bars: ExecutionRows | None = None, metadata: dict[str, Any] | None = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    rankings, _rows, regime = evaluate_candidates(bars, research_start, research_end, execution_bars, metadata)
+def build_playbook_snapshot(bars: list[dict[str, Any]], research_start: int, research_end: int, execution_bars: ExecutionRows | None = None, metadata: dict[str, Any] | None = None, progress: ProgressFn | None = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    rankings, _rows, regime = evaluate_candidates(bars, research_start, research_end, execution_bars, metadata, progress)
     accepted = [r for r in rankings if r.get("status") == "ACCEPTED" and r.get("correlation_status") == "ACCEPTED"]
     playbook = [item["name"] for item in accepted[:10]]
     vals = [float(item["oos_expectancy"]) for item in accepted] or [0.0]

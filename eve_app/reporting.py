@@ -6,6 +6,7 @@ from typing import Any
 
 from .engine import phase_state
 from .storage import Storage, utc_now_ts
+from .strategies import TOTAL_CANDIDATES
 
 
 def _weighted_price(deals: list[dict[str, Any]]) -> float:
@@ -220,6 +221,16 @@ def build_dashboard(storage: Storage, session_id: str | None = None) -> dict[str
 
     phase = phase_state(session)
     candidates = storage.latest_candidate_scores(session["id"])
+    research_progress = storage.research_progress(session["id"]) or {
+        "candidates_completed": 0,
+        "total_candidates": TOTAL_CANDIDATES,
+        "walk_forward_folds_completed": 0,
+        "best_profit_factor": None,
+        "best_win_rate": None,
+        "best_average_r": None,
+        "stage": "waiting",
+        "estimated_seconds_remaining": None,
+    }
     reports = _position_reports(storage, session)
     closed = [r for r in reports if r["status"] == "CLOSED"]
     wins = [r for r in closed if r["net_profit"] > 0]
@@ -251,6 +262,7 @@ def build_dashboard(storage: Storage, session_id: str | None = None) -> dict[str
             "last_seen_at": session.get("last_seen_at"),
         },
         "candidate_scores": candidates,
+        "research_progress": research_progress,
         "research_dashboard": _research_dashboard(candidates),
         "strategy_snapshot": strategy_snapshot,
         "historical_data": historical_data,

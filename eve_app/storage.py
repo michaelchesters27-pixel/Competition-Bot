@@ -147,6 +147,20 @@ class Storage:
                 );
                 CREATE INDEX IF NOT EXISTS idx_logs_session_time
                     ON engine_logs(session_id, created_at DESC);
+
+                CREATE TABLE IF NOT EXISTS research_progress (
+                    session_id TEXT PRIMARY KEY,
+                    candidates_completed INTEGER NOT NULL DEFAULT 0,
+                    total_candidates INTEGER NOT NULL,
+                    walk_forward_folds_completed INTEGER NOT NULL DEFAULT 0,
+                    best_profit_factor REAL,
+                    best_win_rate REAL,
+                    best_average_r REAL,
+                    stage TEXT NOT NULL,
+                    estimated_seconds_remaining INTEGER,
+                    updated_at INTEGER NOT NULL,
+                    FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+                );
                 """
             )
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()}
@@ -427,6 +441,60 @@ class Storage:
                 """,
                 (session_id, utc_now_ts(), level, event, message, _json(details or {})),
             )
+
+    def save_research_progress(
+        self,
+        session_id: str,
+        *,
+        candidates_completed: int,
+        total_candidates: int,
+        walk_forward_folds_completed: int,
+        best_profit_factor: float | None,
+        best_win_rate: float | None,
+        best_average_r: float | None,
+        stage: str,
+        estimated_seconds_remaining: int | None,
+    ) -> None:
+        with _LOCK, self.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO research_progress(
+                    session_id,candidates_completed,total_candidates,walk_forward_folds_completed,
+                    best_profit_factor,best_win_rate,best_average_r,stage,
+                    estimated_seconds_remaining,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    candidates_completed=excluded.candidates_completed,
+                    total_candidates=excluded.total_candidates,
+                    walk_forward_folds_completed=excluded.walk_forward_folds_completed,
+                    best_profit_factor=excluded.best_profit_factor,
+                    best_win_rate=excluded.best_win_rate,
+                    best_average_r=excluded.best_average_r,
+                    stage=excluded.stage,
+                    estimated_seconds_remaining=excluded.estimated_seconds_remaining,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    session_id,
+                    candidates_completed,
+                    total_candidates,
+                    walk_forward_folds_completed,
+                    best_profit_factor,
+                    best_win_rate,
+                    best_average_r,
+                    stage,
+                    estimated_seconds_remaining,
+                    utc_now_ts(),
+                ),
+            )
+
+    def research_progress(self, session_id: str) -> dict[str, Any] | None:
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM research_progress WHERE session_id=?",
+                (session_id,),
+            ).fetchone()
+        return dict(row) if row else None
 
     def session_signals(self, session_id: str) -> list[dict[str, Any]]:
         with self.connection() as conn:
