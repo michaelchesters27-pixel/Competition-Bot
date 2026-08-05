@@ -187,7 +187,8 @@ class SupabaseMarketCandles:
         }
         with self._connect() as conn:
             conn.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
-            conn.execute("SET statement_timeout = %s", (self.config.timeout_seconds * 1000,))
+            timeout_ms = max(0, int(self.config.timeout_seconds) * 1000)
+            conn.execute(f"SET statement_timeout = {timeout_ms}")
             with conn.transaction():
                 rows = conn.execute(self._select_sql(use_source_filter), params).fetchall()
         return normalize_bars(rows)
