@@ -57,7 +57,10 @@ def test_candle_time_timestamp_filtering_uses_timestamp_parameters():
         class Conn:
             def __enter__(self): return self
             def __exit__(self, *args): return False
-            def transaction(self, read_only=True): return Tx()
+            def transaction(self, *args, **kwargs):
+                assert args == ()
+                assert kwargs == {}
+                return Tx()
             def execute(self, sql, params=None):
                 if params and "start_time" in params:
                     captured.update(params)
@@ -71,6 +74,41 @@ def test_candle_time_timestamp_filtering_uses_timestamp_parameters():
     assert isinstance(captured["start_time"], datetime)
     assert captured["start_time"].tzinfo is not None
     assert isinstance(captured["end_time"], datetime)
+
+
+def test_historical_transactions_do_not_pass_read_only_keyword():
+    config = HistoricalConfig(database_url="postgresql://reader@example/db")
+    source = _source(config)
+    transaction_kwargs = []
+
+    class Tx:
+        def __enter__(self): return None
+        def __exit__(self, *args): return False
+
+    class Rows:
+        def __init__(self, row=None):
+            self.row = row
+        def fetchall(self): return []
+        def fetchone(self): return self.row
+
+    class Conn:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def transaction(self, *args, **kwargs):
+            transaction_kwargs.append(kwargs)
+            if "read_only" in kwargs:
+                raise TypeError("Connection.transaction() got an unexpected keyword argument 'read_only'")
+            return Tx()
+        def execute(self, sql, params=None):
+            if "MIN" in sql:
+                return Rows({"earliest_time": None})
+            return Rows()
+
+    source._connect = lambda: Conn()
+
+    source._fetch("XAUUSD", "M5", 1_700_000_000, 1_700_086_400)
+    assert source.earliest_time("XAUUSD", "M5") is None
+    assert transaction_kwargs == [{}, {}]
 
 
 def test_completed_candles_only_are_loaded():
