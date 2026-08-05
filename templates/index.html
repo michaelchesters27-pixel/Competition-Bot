@@ -68,7 +68,20 @@
     .reason-list { margin: 10px 0 0; padding-left: 20px; color: #c4d7ea; }
     .details-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-top: 14px; }
     pre { white-space: pre-wrap; word-break: break-word; color: #b7cce0; background: #07111f; padding: 12px; border-radius: 10px; border: 1px solid var(--line); font-size: 12px; }
-    .log { display: grid; grid-template-columns: 90px 130px 1fr; gap: 10px; padding: 9px 0; border-bottom: 1px solid rgba(65,92,122,.28); font-size: 13px; }
+    .live-status { margin-bottom: 18px; padding: 14px; border-radius: 14px; background: rgba(5,15,27,.44); border: 1px solid rgba(78,113,148,.25); }
+    .live-status-head { display: flex; justify-content: space-between; gap: 12px; align-items: center; margin-bottom: 12px; }
+    .live-pill { display: inline-flex; align-items: center; gap: 8px; padding: 6px 10px; border-radius: 999px; background: rgba(69,214,255,.08); border: 1px solid rgba(69,214,255,.35); color: var(--accent); font-size: 11px; font-weight: 850; letter-spacing: .08em; text-transform: uppercase; }
+    .live-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+    .live-metric { min-width: 0; padding: 11px; border-radius: 12px; background: rgba(7,17,31,.62); border: 1px solid rgba(65,92,122,.34); }
+    .live-metric .value { font-variant-numeric: tabular-nums; }
+    .mini-progress { height: 8px; border-radius: 999px; background: #07111f; border: 1px solid var(--line); overflow: hidden; margin-top: 10px; }
+    .mini-progress > div { height: 100%; width: 0; background: linear-gradient(90deg, var(--accent), var(--good)); transition: width .5s ease; }
+    .activity-history { border-top: 1px solid rgba(65,92,122,.28); padding-top: 4px; }
+    .log { display: grid; grid-template-columns: 108px 172px minmax(0, 1fr); gap: 12px; align-items: start; padding: 10px 0; border-bottom: 1px solid rgba(65,92,122,.28); font-size: 13px; }
+    .log-time, .log-event, .log-message { min-width: 0; overflow-wrap: anywhere; word-break: normal; }
+    .log-time { font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .log-event { font-weight: 800; color: #d8eaff; }
+    .log-message { color: #c4d7ea; line-height: 1.45; }
     .empty { color: var(--muted); padding: 20px 0; }
     .wide { grid-column: 1 / -1; }
     @media (max-width: 1050px) {
@@ -83,7 +96,10 @@
       .session-meta, .details-grid { grid-template-columns: 1fr; }
       .trade summary { grid-template-columns: 70px 1fr; }
       .trade summary > :nth-child(3), .trade summary > :nth-child(4) { text-align: left !important; }
+      .live-status-head { align-items: flex-start; flex-direction: column; }
+      .live-grid { grid-template-columns: 1fr; }
       .log { grid-template-columns: 1fr; gap: 3px; }
+      .log-time { white-space: normal; }
     }
   </style>
 </head>
@@ -133,7 +149,23 @@
       </div>
       <div class="card">
         <h2>Engine activity</h2>
-        <div id="logs" class="empty">No activity yet.</div>
+        <div class="live-status" aria-live="polite">
+          <div class="live-status-head">
+            <span class="label">Live research status</span>
+            <span id="livePhase" class="live-pill">Waiting</span>
+          </div>
+          <div class="live-grid">
+            <div class="live-metric"><div class="label">Time remaining</div><div id="liveRemaining" class="value">—</div></div>
+            <div class="live-metric"><div class="label">Research stage</div><div id="liveStage" class="value">Waiting for data</div></div>
+            <div class="live-metric"><div class="label">Strategies</div><div id="liveStrategies" class="value">0 / 0</div></div>
+            <div class="live-metric"><div class="label">Complete</div><div id="livePercent" class="value">0%</div><div class="mini-progress"><div id="liveProgressBar"></div></div></div>
+            <div class="live-metric"><div class="label">Best PF</div><div id="liveBestPf" class="value">—</div></div>
+            <div class="live-metric"><div class="label">Best win rate</div><div id="liveBestWin" class="value">—</div></div>
+            <div class="live-metric"><div class="label">Best average R</div><div id="liveBestR" class="value">—</div></div>
+            <div class="live-metric"><div class="label">ETA</div><div id="liveEta" class="value">—</div></div>
+          </div>
+        </div>
+        <div id="logs" class="activity-history empty">No activity yet.</div>
       </div>
       <div class="card wide">
         <h2>Full trade reports</h2>
@@ -188,12 +220,49 @@
         </tr>`).join('')}</tbody></table>`;
     }
 
+    function researchStage(logs, phase) {
+      const latest = (logs || []).find((r) => ['RESEARCH_STAGE_PROGRESS','RESEARCH_JOB_STARTED','RESEARCH_UPDATE','RESEARCH_COMPLETED','RESEARCH_FAILED','PLAYBOOK_FROZEN'].includes(r.event));
+      if (!latest) return phase === 'RESEARCH' ? 'Waiting for research worker' : phase === 'TRADING' ? 'Playbook ready' : 'Idle';
+      if (latest.event === 'RESEARCH_STAGE_PROGRESS') return latest.details?.stage ? String(latest.details.stage).replaceAll('_', ' ') : latest.message;
+      if (latest.event === 'RESEARCH_JOB_STARTED') return 'Research job started';
+      if (latest.event === 'RESEARCH_UPDATE') return 'Ranking candidates';
+      if (latest.event === 'PLAYBOOK_FROZEN' || latest.event === 'RESEARCH_COMPLETED') return 'Research complete';
+      if (latest.event === 'RESEARCH_FAILED') return 'Research failed';
+      return latest.message || 'Research active';
+    }
+
+    function bestCandidate(rows) {
+      const candidates = [...(rows || [])].filter(Boolean);
+      candidates.sort((a, b) => Number(b.oos_profit_factor ?? b.profit_factor ?? 0) - Number(a.oos_profit_factor ?? a.profit_factor ?? 0));
+      return candidates[0] || null;
+    }
+
+    function renderLiveStatus(data) {
+      const s = data.session || {};
+      const rows = data.candidate_scores || data.research_dashboard || [];
+      const total = Math.max(rows.length || 0, Number(rows[0]?.candidate_families_tested || rows[0]?.total_strategies || 0), 25);
+      const evaluated = Math.min(total, rows.length || 0);
+      const percent = total ? Math.min(100, evaluated / total * 100) : 0;
+      const best = bestCandidate(rows);
+      const stage = researchStage(data.logs, s.phase);
+      $('livePhase').textContent = s.phase === 'RESEARCH' ? 'Research' : s.phase === 'TRADING' ? 'Trading' : (s.phase || 'Waiting');
+      $('liveRemaining').textContent = fmtClock(s.remaining_seconds);
+      $('liveStage').textContent = stage;
+      $('liveStrategies').textContent = `${evaluated} / ${total}`;
+      $('livePercent').textContent = `${percent.toFixed(0)}%`;
+      $('liveProgressBar').style.width = `${percent}%`;
+      $('liveBestPf').textContent = best ? Number(best.oos_profit_factor ?? best.profit_factor ?? 0).toFixed(2) : '—';
+      $('liveBestWin').textContent = best ? `${Number(best.win_rate || 0).toFixed(1)}%` : '—';
+      $('liveBestR').textContent = best ? `${Number(best.oos_expectancy ?? best.expectancy ?? best.average_r ?? 0).toFixed(3)}R` : '—';
+      $('liveEta').textContent = s.phase === 'RESEARCH' ? fmtClock(s.remaining_seconds) : '—';
+    }
+
     function renderLogs(rows) {
-      if (!rows?.length) { $('logs').className='empty'; $('logs').textContent='No activity yet.'; return; }
-      $('logs').className='';
+      if (!rows?.length) { $('logs').className='activity-history empty'; $('logs').textContent='No activity yet.'; return; }
+      $('logs').className='activity-history';
       $('logs').innerHTML = rows.slice(0,30).map(r=>`<div class="log">
-        <span class="label">${new Date(r.created_at*1000).toLocaleTimeString()}</span>
-        <strong>${esc(r.event)}</strong><span>${esc(r.message)}</span>
+        <span class="log-time label">${new Date(r.created_at*1000).toLocaleTimeString()}</span>
+        <span class="log-event">${esc(r.event)}</span><span class="log-message">${esc(r.message)}</span>
       </div>`).join('');
     }
 
@@ -270,6 +339,7 @@
       $('averageR').textContent=`${Number(st.average_r).toFixed(2)}R`;
       $('openTrades').textContent=st.open_trades;
       renderCandidates(data.research_dashboard || data.candidate_scores);
+      renderLiveStatus(data);
       renderLogs(data.logs);
       renderTrades(data.trade_reports);
     }
