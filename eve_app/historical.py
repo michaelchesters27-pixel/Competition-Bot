@@ -5,7 +5,7 @@ import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 from urllib.parse import urlparse
 
 Bar = dict[str, Any]
@@ -111,6 +111,7 @@ class HistoricalDataset:
     m5_bars: list[Bar]
     m1_bars: list[Bar]
     metadata: dict[str, Any]
+    m1_window_provider: Callable[[int, int], list[Bar]] | None = None
 
     @property
     def valid(self) -> bool:
@@ -227,8 +228,7 @@ class SupabaseMarketCandles:
         )
         return earliest
 
-    def _fetch_chunked(self, symbol: str, timeframe: str, start_ts: int, end_ts: int) -> list[Bar]:
-        out: list[Bar] = []
+    def _iter_chunks(self, symbol: str, timeframe: str, start_ts: int, end_ts: int) -> Iterable[list[Bar]]:
         step = self.config.chunk_days * 86400
         cursor = start_ts
         while cursor < end_ts:
@@ -236,9 +236,20 @@ class SupabaseMarketCandles:
             rows = self._fetch(symbol, timeframe, cursor, chunk_end, use_source_filter=True)
             if not rows and self.config.filter_preferred_source:
                 rows = self._fetch(symbol, timeframe, cursor, chunk_end, use_source_filter=False)
-            out.extend(rows)
+            yield normalize_bars(rows)
             cursor = chunk_end
+
+    def _fetch_chunked(self, symbol: str, timeframe: str, start_ts: int, end_ts: int) -> list[Bar]:
+        out: list[Bar] = []
+        for rows in self._iter_chunks(symbol, timeframe, start_ts, end_ts):
+            out.extend(rows)
         return normalize_bars(out)
+
+    def _fetch_window(self, symbol: str, timeframe: str, start_ts: int, end_ts: int) -> list[Bar]:
+        rows = self._fetch(symbol, timeframe, start_ts, end_ts, use_source_filter=True)
+        if not rows and self.config.filter_preferred_source:
+            rows = self._fetch(symbol, timeframe, start_ts, end_ts, use_source_filter=False)
+        return normalize_bars(rows)
 
     @staticmethod
     def _symbol_candidates(symbol: str) -> list[str]:
@@ -292,20 +303,34 @@ class SupabaseMarketCandles:
                     "m1_bars": 0,
                 },
             )
-        start_ts = earliest
+        start_ts = earliest_m5 if earliest_m5 is not None else earliest
         if self.config.lookback_days is not None:
             start_ts = max(start_ts, end_ts - self.config.lookback_days * 86400)
-        m5 = self._fetch_chunked(query_symbol, self.config.m5_value, start_ts, end_ts)
-        m1 = self._fetch_chunked(query_symbol, self.config.m1_value, start_ts, end_ts)
+        m5: list[Bar] = []
+        processed = 0
+        for chunk in self._iter_chunks(query_symbol, self.config.m5_value, start_ts, end_ts):
+            m5.extend(chunk)
+            processed += len(chunk)
+            logger.info(
+                "historical research progress",
+                extra={
+                    "m5_candles_processed": processed,
+                    "current_date_range": f"{_dt(start_ts).date().isoformat()} to {_dt(end_ts).date().isoformat()}",
+                    "strategies_completed": 0,
+                    "configured_chunk_days": self.config.chunk_days,
+                },
+            )
+            del chunk
+        m5 = normalize_bars(m5)
         source = "STORED_M5"
-        if not m5 and m1:
-            m5 = build_m5_from_m1(m1)
-            source = "BUILT_FROM_M1_FALLBACK"
+        m1_window_provider = (
+            lambda window_start, window_end: self._fetch_window(query_symbol, self.config.m1_value, int(window_start), int(window_end))
+        ) if earliest_m1 is not None else None
         valid = bool(m5)
         reason = "OK" if valid else "No completed M5 candles available and M1 fallback unavailable"
         return HistoricalDataset(
             m5_bars=m5,
-            m1_bars=m1,
+            m1_bars=[],
             metadata={
                 "valid": valid,
                 "reason": reason,
@@ -317,7 +342,7 @@ class SupabaseMarketCandles:
                 "earliest_m5": earliest_m5,
                 "earliest_m1": earliest_m1,
                 "m5_source": source,
-                "m1_available": bool(m1),
+                "m1_available": earliest_m1 is not None,
                 "spread_source": "COLUMN" if self.config.spread_column else "ASSUMED",
                 "preferred_source": self.config.preferred_source if self.config.filter_preferred_source else "DISABLED",
                 "lookback_days": self.config.lookback_days,
@@ -325,8 +350,10 @@ class SupabaseMarketCandles:
                 "start_ts": start_ts,
                 "end_ts": end_ts,
                 "m5_bars": len(m5),
-                "m1_bars": len(m1),
+                "m1_bars": 0,
+                "m1_loading_mode": "ON_DEMAND_WINDOWS" if earliest_m1 is not None else "UNAVAILABLE",
             },
+            m1_window_provider=m1_window_provider,
         )
 
 
