@@ -263,23 +263,20 @@ def test_symbol_value_override_is_used_for_historical_queries():
 
     def fake_earliest(symbol, timeframe):
         earliest_calls.append((symbol, timeframe))
-        return 1_700_000_000 if timeframe == "5min" else None
+        return None
 
-    def fake_iter_chunks(symbol, timeframe, start_ts, end_ts):
-        fetch_calls.append((symbol, timeframe, start_ts, end_ts))
-        if timeframe == "5min":
-            yield [{"time": start_ts, "open": 1, "high": 2, "low": 0, "close": 1, "tick_volume": 1, "spread": 0}]
-        else:
-            yield []
+    def fake_fetch_recent_m5(symbol, end_ts):
+        fetch_calls.append((symbol, end_ts))
+        return [{"time": 1_700_000_000, "open": 1, "high": 2, "low": 0, "close": 1, "tick_volume": 1, "spread": 0}]
 
     source.earliest_time = fake_earliest
-    source._iter_chunks = fake_iter_chunks
+    source._fetch_recent_m5 = fake_fetch_recent_m5
 
     dataset = source.get_research_dataset("XAUUSD", 1_700_000_300)
 
     assert dataset.valid
-    assert earliest_calls == [("XAU/USD", "5min"), ("XAU/USD", "1min")]
-    assert fetch_calls == [("XAU/USD", "5min", 1_700_000_000, 1_700_000_300)]
+    assert earliest_calls == [("XAU/USD", "1min")]
+    assert fetch_calls == [("XAU/USD", 1_700_000_300)]
     assert dataset.metadata["requested_symbol"] == "XAUUSD"
     assert dataset.metadata["query_symbol"] == "XAU/USD"
     assert dataset.metadata["m5_interval"] == "5min"
@@ -299,25 +296,22 @@ def test_xauusd_falls_back_to_slash_symbol_for_historical_queries():
 
     def fake_earliest(symbol, timeframe):
         earliest_calls.append((symbol, timeframe))
-        if symbol == "XAU/USD" and timeframe == "5min":
-            return 1_700_000_000
         return None
 
-    def fake_iter_chunks(symbol, timeframe, start_ts, end_ts):
-        fetch_calls.append((symbol, timeframe, start_ts, end_ts))
-        if symbol == "XAU/USD" and timeframe == "5min":
-            yield [{"time": start_ts, "open": 1, "high": 2, "low": 0, "close": 1, "tick_volume": 1, "spread": 0}]
-        else:
-            yield []
+    def fake_fetch_recent_m5(symbol, end_ts):
+        fetch_calls.append((symbol, end_ts))
+        if symbol == "XAU/USD":
+            return [{"time": 1_700_000_000, "open": 1, "high": 2, "low": 0, "close": 1, "tick_volume": 1, "spread": 0}]
+        return []
 
     source.earliest_time = fake_earliest
-    source._iter_chunks = fake_iter_chunks
+    source._fetch_recent_m5 = fake_fetch_recent_m5
 
     dataset = source.get_research_dataset("XAUUSD", 1_700_000_300)
 
     assert dataset.valid
-    assert earliest_calls == [("XAUUSD", "5min"), ("XAUUSD", "1min"), ("XAU/USD", "5min"), ("XAU/USD", "1min")]
-    assert fetch_calls == [("XAU/USD", "5min", 1_700_000_000, 1_700_000_300)]
+    assert earliest_calls == [("XAU/USD", "1min")]
+    assert fetch_calls == [("XAUUSD", 1_700_000_300), ("XAU/USD", 1_700_000_300)]
     assert dataset.metadata["requested_symbol"] == "XAUUSD"
     assert dataset.metadata["query_symbol"] == "XAU/USD"
     assert dataset.metadata["earliest_m5"] == 1_700_000_000
@@ -330,12 +324,15 @@ def test_research_dataset_does_not_retain_complete_m1_history():
     source.earliest_time = lambda symbol, timeframe: 1_700_000_000
     fetch_calls = []
 
+    def fake_fetch_recent_m5(symbol, end_ts):
+        fetch_calls.append(("5min", end_ts))
+        return [{"time": 1_700_000_000, "open": 1, "high": 2, "low": 0, "close": 1, "tick_volume": 1, "spread": 0}]
+
     def fake_fetch(symbol, timeframe, start_ts, end_ts, use_source_filter=True):
         fetch_calls.append((timeframe, start_ts, end_ts))
-        if timeframe == "5min":
-            return [{"time": start_ts, "open": 1, "high": 2, "low": 0, "close": 1, "tick_volume": 1, "spread": 0}]
         return [{"time": start_ts, "open": 1, "high": 2, "low": 0, "close": 1, "tick_volume": 1, "spread": 0}]
 
+    source._fetch_recent_m5 = fake_fetch_recent_m5
     source._fetch = fake_fetch
 
     dataset = source.get_research_dataset("XAUUSD", 1_700_000_300)
@@ -356,6 +353,7 @@ def test_invalid_historical_dataset_reports_query_diagnostics():
     config = HistoricalConfig(database_url="postgresql://reader@example/db", symbol_value="XAU/USD", m5_value="5min", m1_value="1min")
     source = _source(config)
     source.earliest_time = lambda symbol, timeframe: None
+    source._fetch_recent_m5 = lambda symbol, end_ts: []
 
     dataset = source.get_research_dataset("XAUUSD", 1_700_000_300)
 
@@ -461,3 +459,48 @@ def test_failed_historical_connection_cannot_promote_strategy(tmp_path):
     assert storage.latest_candidate_scores(started["session_id"]) == []
     logs = storage.session_logs(started["session_id"], limit=10)
     assert any(log["event"] == "HISTORICAL_DATA_UNAVAILABLE" for log in logs)
+
+
+def test_recent_m5_sql_uses_descending_order_and_default_limit():
+    config = HistoricalConfig(database_url="postgresql://reader@example/db")
+    source = _source(config)
+
+    sql = source._select_recent_m5_sql()
+
+    assert config.max_m5_bars == 50000
+    assert 'ORDER BY "candle_time" DESC LIMIT 50000' in " ".join(sql.split())
+    assert '"candle_time" >= %(start_time)s' not in sql
+
+
+def test_fetch_recent_m5_reverses_descending_rows_to_chronological_order():
+    config = HistoricalConfig(database_url="postgresql://reader@example/db", filter_preferred_source=False)
+    source = _source(config)
+    captured = []
+
+    class Tx:
+        def __enter__(self): return None
+        def __exit__(self, *args): return False
+
+    class Rows:
+        def fetchall(self):
+            return [
+                {"time": 300, "open": 3, "high": 4, "low": 2, "close": 3, "tick_volume": 1, "spread": 0},
+                {"time": 0, "open": 1, "high": 2, "low": 0, "close": 1, "tick_volume": 1, "spread": 0},
+            ]
+
+    class Conn:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def transaction(self): return Tx()
+        def execute(self, sql, params=None):
+            captured.append((sql, params))
+            return Rows()
+
+    source._connect = lambda: Conn()
+
+    rows = source._fetch_recent_m5("XAU/USD", 600)
+
+    assert [row["time"] for row in rows] == [0, 300]
+    select_sql = next(sql for sql, params in captured if params and params.get("timeframe") == "5min")
+    assert 'ORDER BY "candle_time" DESC LIMIT 50000' in " ".join(select_sql.split())
+    assert all(not (params and "start_time" in params) for _sql, params in captured)

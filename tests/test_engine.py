@@ -118,3 +118,21 @@ def test_playbook_freezes_and_live_model_can_issue_signal():
     )
     assert signal is None
     assert decision["decision"] == "HOLD"
+
+
+def test_research_evaluation_memory_stays_bounded():
+    import tracemalloc
+
+    bars = synthetic_bars(count=1200)
+    research_start = bars[0]["time"]
+    research_end = bars[-1]["time"] + 300
+
+    tracemalloc.start()
+    try:
+        _rankings, rows, _regime = evaluate_candidates(bars, research_start, research_end)
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert len(rows) == len(bars)
+    assert peak < 64 * 1024 * 1024

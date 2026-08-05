@@ -70,6 +70,7 @@ class HistoricalConfig:
     lookback_days: int | None = None
     chunk_days: int = 30
     timeout_seconds: int = 20
+    max_m5_bars: int = 50000
     enabled: bool = True
 
     @classmethod
@@ -102,6 +103,7 @@ class HistoricalConfig:
             lookback_days=lookback_days,
             chunk_days=max(1, int(_env("EVE_HISTORICAL_CHUNK_DAYS", "30"))),
             timeout_seconds=int(_env("EVE_HISTORICAL_QUERY_TIMEOUT_SECONDS", "20")),
+            max_m5_bars=max(120, int(_env("EVE_HISTORICAL_MAX_M5_BARS", "50000"))),
             enabled=enabled,
         )
 
@@ -148,7 +150,7 @@ class SupabaseMarketCandles:
             raise ValueError("Historical candle table must be table or schema.table")
         return ".".join(cls._safe_identifier(part) for part in parts)
 
-    def _select_sql(self, use_source_filter: bool = True) -> str:
+    def _select_sql(self, use_source_filter: bool = True, descending: bool = False, limit: int | None = None) -> str:
         c = self.config
         cols = {
             "time": c.time_column,
@@ -172,11 +174,64 @@ class SupabaseMarketCandles:
               AND {self._safe_identifier(c.complete_column)} = true
               AND {self._safe_identifier(c.time_column)} >= %(start_time)s
               AND {self._safe_identifier(c.time_column)} < %(end_time)s{source_clause}
-            ORDER BY {self._safe_identifier(c.time_column)} ASC
+            ORDER BY {self._safe_identifier(c.time_column)} {"DESC" if descending else "ASC"}{f" LIMIT {int(limit)}" if limit is not None else ""}
         """
 
     def _connect(self):
         return self._psycopg.connect(self.config.database_url, row_factory=self._dict_row)
+
+    def _fetch_recent_m5(self, symbol: str, end_ts: int) -> list[Bar]:
+        params = {
+            "symbol": symbol,
+            "timeframe": self.config.m5_value,
+            "source": self.config.preferred_source,
+            "end_time": _dt(end_ts),
+        }
+        with self._connect() as conn:
+            conn.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
+            timeout_ms = max(0, int(self.config.timeout_seconds) * 1000)
+            conn.execute(f"SET statement_timeout = {timeout_ms}")
+            with conn.transaction():
+                rows = conn.execute(self._select_recent_m5_sql(use_source_filter=True), params).fetchall()
+                if not rows and self.config.filter_preferred_source:
+                    rows = conn.execute(self._select_recent_m5_sql(use_source_filter=False), params).fetchall()
+        bars = [
+            {
+                "time": _ts(row["time"]),
+                "open": float(row["open"]),
+                "high": float(row["high"]),
+                "low": float(row["low"]),
+                "close": float(row["close"]),
+                "tick_volume": float(row.get("tick_volume") or 0),
+                "spread": float(row.get("spread") or 0),
+            }
+            for row in rows
+        ]
+        bars.reverse()
+        return bars
+
+    def _select_recent_m5_sql(self, use_source_filter: bool = True) -> str:
+        c = self.config
+        cols = {
+            "time": c.time_column,
+            "open": c.open_column,
+            "high": c.high_column,
+            "low": c.low_column,
+            "close": c.close_column,
+            "tick_volume": c.volume_column,
+        }
+        selected = [f"{self._safe_identifier(src)} AS {self._safe_identifier(alias)}" for alias, src in cols.items()]
+        selected.append(f"{self._safe_identifier(c.spread_column)} AS {self._safe_identifier('spread')}" if c.spread_column else f"0::double precision AS {self._safe_identifier('spread')}")
+        source_clause = f"\n              AND {self._safe_identifier(c.source_column)} = %(source)s" if use_source_filter and c.filter_preferred_source else ""
+        return f"""
+            SELECT {','.join(selected)}
+            FROM {self._table}
+            WHERE {self._safe_identifier(c.symbol_column)} = %(symbol)s
+              AND {self._safe_identifier(c.timeframe_column)} = %(timeframe)s
+              AND {self._safe_identifier(c.complete_column)} = true
+              AND {self._safe_identifier(c.time_column)} < %(end_time)s{source_clause}
+            ORDER BY {self._safe_identifier(c.time_column)} DESC LIMIT {int(c.max_m5_bars)}
+        """
 
     def _fetch(self, symbol: str, timeframe: str, start_ts: int, end_ts: int, use_source_filter: bool = True) -> list[Bar]:
         params = {
@@ -269,21 +324,17 @@ class SupabaseMarketCandles:
     def get_research_dataset(self, symbol: str, end_ts: int) -> HistoricalDataset:
         symbol_candidates = [self.config.symbol_value] if self.config.symbol_value else self._symbol_candidates(symbol)
         query_symbol = symbol_candidates[0]
-        earliest_m5: int | None = None
-        earliest_m1: int | None = None
-        earliest: int | None = None
+        m5: list[Bar] = []
         for candidate in symbol_candidates:
-            candidate_m5, candidate_m1 = self._earliest_for_symbol(candidate)
-            candidate_earliest = min([t for t in (candidate_m5, candidate_m1) if t is not None], default=None)
             query_symbol = candidate
-            earliest_m5 = candidate_m5
-            earliest_m1 = candidate_m1
-            earliest = candidate_earliest
-            if candidate_earliest is not None:
+            m5 = self._fetch_recent_m5(candidate, end_ts)
+            if m5:
                 break
-        if earliest is None:
+        earliest_m5 = int(m5[0]["time"]) if m5 else None
+        earliest_m1 = self.earliest_time(query_symbol, self.config.m1_value) if m5 else None
+        if not m5:
             reason = (
-                f"No completed historical candles found for symbol={query_symbol!r}, "
+                f"No completed historical M5 candles found for symbol={query_symbol!r}, "
                 f"M5 interval={self.config.m5_value!r}, M1 interval={self.config.m1_value!r}"
             )
             return HistoricalDataset(
@@ -299,41 +350,23 @@ class SupabaseMarketCandles:
                     "m1_interval": self.config.m1_value,
                     "earliest_m5": earliest_m5,
                     "earliest_m1": earliest_m1,
+                    "max_m5_bars": self.config.max_m5_bars,
                     "m5_bars": 0,
                     "m1_bars": 0,
                 },
             )
-        start_ts = earliest_m5 if earliest_m5 is not None else earliest
-        if self.config.lookback_days is not None:
-            start_ts = max(start_ts, end_ts - self.config.lookback_days * 86400)
-        m5: list[Bar] = []
-        processed = 0
-        for chunk in self._iter_chunks(query_symbol, self.config.m5_value, start_ts, end_ts):
-            m5.extend(chunk)
-            processed += len(chunk)
-            logger.info(
-                "historical research progress",
-                extra={
-                    "m5_candles_processed": processed,
-                    "current_date_range": f"{_dt(start_ts).date().isoformat()} to {_dt(end_ts).date().isoformat()}",
-                    "strategies_completed": 0,
-                    "configured_chunk_days": self.config.chunk_days,
-                },
-            )
-            del chunk
-        m5 = normalize_bars(m5)
-        source = "STORED_M5"
-        m1_window_provider = (
-            lambda window_start, window_end: self._fetch_window(query_symbol, self.config.m1_value, int(window_start), int(window_end))
-        ) if earliest_m1 is not None else None
-        valid = bool(m5)
-        reason = "OK" if valid else "No completed M5 candles available and M1 fallback unavailable"
+        source = "STORED_M5_LIMITED"
+        m1_window_provider = None
+        if earliest_m1 is not None:
+            def m1_window_provider(window_start: int, window_end: int) -> list[Bar]:
+                return self._fetch_window(query_symbol, self.config.m1_value, int(window_start), int(window_end))
+
         return HistoricalDataset(
             m5_bars=m5,
             m1_bars=[],
             metadata={
-                "valid": valid,
-                "reason": reason,
+                "valid": True,
+                "reason": "OK",
                 "source_table": self.config.table,
                 "requested_symbol": symbol,
                 "query_symbol": query_symbol,
@@ -347,7 +380,9 @@ class SupabaseMarketCandles:
                 "preferred_source": self.config.preferred_source if self.config.filter_preferred_source else "DISABLED",
                 "lookback_days": self.config.lookback_days,
                 "chunk_days": self.config.chunk_days,
-                "start_ts": start_ts,
+                "max_m5_bars": self.config.max_m5_bars,
+                "m5_query_order": "DESC_LIMIT_REVERSED",
+                "start_ts": earliest_m5,
                 "end_ts": end_ts,
                 "m5_bars": len(m5),
                 "m1_bars": 0,
