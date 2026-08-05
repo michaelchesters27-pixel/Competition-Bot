@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import json
 import os
 from functools import wraps
@@ -8,6 +9,7 @@ from typing import Any, Callable
 from flask import Flask, Response, jsonify, render_template, request
 
 from eve_app.engine import CompetitionEngine
+from eve_app.historical import HistoricalConfig, _safe_database_identity
 from eve_app.reporting import build_dashboard
 from eve_app.storage import Storage
 
@@ -62,6 +64,63 @@ def pulse_wire(payload: dict[str, Any]) -> str:
         "; ".join(payload.get("reasons", [])) or "-",
     ]
     return "|".join(clean_field(v) for v in fields)
+
+
+def _historical_check_payload() -> dict[str, Any]:
+    config = HistoricalConfig.from_env()
+    payload: dict[str, Any] = {
+        "database_host": "",
+        "database_name": "",
+        "current_schema": None,
+        "market_candles_count": None,
+        "xauusd_5min_completed": {"min_candle_time": None, "max_candle_time": None, "count": None},
+        "configured": {"table": None, "symbol": None, "m5_value": None, "m1_value": None},
+        "database_exception": None,
+    }
+    if config is None:
+        payload["database_exception"] = "Historical database is not configured"
+        return payload
+
+    identity = _safe_database_identity(config.database_url)
+    payload["database_host"] = identity["host"]
+    payload["database_name"] = identity["database"]
+    payload["configured"] = {
+        "table": config.table,
+        "symbol": config.symbol_value,
+        "m5_value": config.m5_value,
+        "m1_value": config.m1_value,
+    }
+
+    try:
+        psycopg = importlib.import_module("psycopg")
+        rows_module = importlib.import_module("psycopg.rows")
+        with psycopg.connect(config.database_url, row_factory=rows_module.dict_row) as conn:
+            conn.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
+            with conn.transaction():
+                schema_row = conn.execute("SELECT current_schema() AS current_schema").fetchone()
+                count_row = conn.execute("SELECT COUNT(*) AS count FROM public.market_candles").fetchone()
+                range_row = conn.execute(
+                    """
+                    SELECT MIN(candle_time) AS min_candle_time,
+                           MAX(candle_time) AS max_candle_time,
+                           COUNT(*) AS count
+                    FROM public.market_candles
+                    WHERE symbol = 'XAU/USD'
+                      AND interval = '5min'
+                      AND is_complete = true
+                    """
+                ).fetchone()
+        payload["current_schema"] = schema_row["current_schema"] if schema_row else None
+        payload["market_candles_count"] = int(count_row["count"]) if count_row else None
+        if range_row:
+            payload["xauusd_5min_completed"] = {
+                "min_candle_time": str(range_row["min_candle_time"]) if range_row["min_candle_time"] is not None else None,
+                "max_candle_time": str(range_row["max_candle_time"]) if range_row["max_candle_time"] is not None else None,
+                "count": int(range_row["count"]),
+            }
+    except Exception as exc:
+        payload["database_exception"] = clean_field(exc)
+    return payload
 
 
 @app.get("/")
@@ -137,6 +196,11 @@ def deal():
     except Exception as exc:
         app.logger.exception("deal record failed")
         return Response(f"ERROR|{clean_field(exc)}", status=500, mimetype="text/plain")
+
+
+@app.get("/api/historical-check")
+def historical_check():
+    return jsonify(_historical_check_payload())
 
 
 @app.get("/api/dashboard")
